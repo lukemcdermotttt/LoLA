@@ -11,11 +11,11 @@ import torch
 import numpy as np
 import pandas as pd
 
-from src.model.load_model_for_eval import load_model_from_checkpoint, load_model_from_config
+from load_model_for_eval import load_model_from_checkpoint, load_model_from_config
 
-LM_EVALUATION_HARNESS_PATH = '/juice2/scr2/mzhang/projects/lm-evaluation-harness'  # Change this to where you clone LM eval harness from
+LM_EVALUATION_HARNESS_PATH = '/home/ubuntu/linearattention/lm-evaluation-harness'  # Change this to where you clone LM eval harness from
 
-RESULTS_PATH = '/scr-ssd/mzhang/projects/lolcats/lm_eval_harness/results_lm_eval.csv'
+RESULTS_PATH = '/home/ubuntu/linearattention/results/results_lm_eval.csv'
 
 
 OPEN_LLM = [  # task, shots
@@ -63,6 +63,8 @@ def get_args():
     parser.add_argument("--no_wandb", action='store_true', default=False)
     parser.add_argument("--wandb_entity", type=str, default='hazy-research')
     parser.add_argument("--replicate", type=int, default=None)
+    parser.add_argument("--model_config_path", type=str, default=None)
+    parser.add_argument("--finetune_config_path", type=str, default=None)
     
     args = parser.parse_args()
 
@@ -169,16 +171,19 @@ def main():
             debug=args.debug,
             lm_eval_model=True,
             path_to_lm_eval_harness=LM_EVALUATION_HARNESS_PATH,
+            model_config_path = args.model_config_path,
+            finetune_config_path = args.finetune_config_path,
         )
     elif args.model_type == 'model_config':
         model, model_config, tokenizer = load_model_from_config(
             model_config_name=args.model_config,
+            model_config_path=args.model_config_path,
             config_dir=args.config_dir,
             lm_eval_model=True,
             path_to_lm_eval_harness=LM_EVALUATION_HARNESS_PATH,
         )
     elif args.model_type == 'huggingface':
-        from lm_eval.models import get_model
+        from ..lm_eval.models import get_model
         model = get_model('hf-causal-experimental').create_from_arg_string(
             '', {'cache_dir': args.cache_dir}
         )

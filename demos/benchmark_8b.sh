@@ -1,6 +1,4 @@
-
-
-CONFIG_DIR='/home/bfs/simran/attention/lolcats/configs/'   # update to your path
+CONFIG_DIR='/home/ubuntu/linearattention/LoLA/configs/'   # update to your path
 
 # """ Benchmarking the 8b model on the LOLCATS dataset """
 

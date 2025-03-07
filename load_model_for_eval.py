@@ -9,10 +9,14 @@ from omegaconf import OmegaConf
 import torch
 
 from src.utils.logging import print_header, print_config, _format_arg
-from .pretrained import get_pretrained_loader
-from .peft import create_peft_config
-from .load_model import load_and_convert_attns
-from .convert_model import remove_base_attention, toggle_attention
+from src.model.pretrained import get_pretrained_loader
+from src.model.peft import create_peft_config
+from src.model.load_model import load_and_convert_attns
+from src.model.convert_model import remove_base_attention, toggle_attention
+try:
+    from huggingface_hub import hf_hub_download
+except ImportError:
+    print("Please pip install huggingface-hub")
 
 # Helpers
 def get_args_from_checkpoint(fname: str):
@@ -101,12 +105,13 @@ def get_lm_eval_model(model_kwargs: dict,  # model_loader.loading_kwargs
         lm = ModelClass.create_from_arg_string('', lm_kwargs)
     else:
         sys.path.append(path_to_lm_eval_harness)
-        from lm_eval.models import get_model
+        from lm_eval_harness.lm_eval.models import get_model
         lm = get_model('hf-causal-experimental').create_from_arg_string('', lm_kwargs)
     return lm
 
 
 def load_model_from_config(model_config_name: str,
+                           model_config_path = None,
                            config_dir: str = './configs',
                            lm_eval_model: bool = False,
                            path_to_lm_eval_harness: str = '/juice2/scr2/mzhang/projects/lm-evaluation-harness',
@@ -115,7 +120,8 @@ def load_model_from_config(model_config_name: str,
     Load model from a config file
     """
     # Load model configs
-    model_config_path = join(config_dir, 'model', f'{model_config_name}.yaml')
+    if model_config_path is None:
+        model_config_path = join(config_dir, 'model', f'{model_config_name}.yaml')
     model_config = OmegaConf.load(model_config_path)
 
     model_loader = get_pretrained_loader(**model_config.model)
@@ -136,8 +142,44 @@ def load_model_from_config(model_config_name: str,
     return model, model_config, tokenizer                   
 
 
+def load_hf_weights(model, distill_repo_id, ft_repo_id, filename="model.pt"):
+    for repo_id in [distill_repo_id, ft_repo_id]:
+        if repo_id is None: continue 
+
+        print(f"Loading weights from {repo_id}")
+
+        local_file_path = hf_hub_download(repo_id=repo_id, filename=filename)    
+        state_dict = torch.load(local_file_path)
+        if 'model_state_dict' in state_dict: 
+            state_dict = state_dict['model_state_dict']
+        else:
+            pass
+        _keys = model.load_state_dict(state_dict, strict=False)
+        if len(_keys.unexpected_keys) > 0:
+            new_state_dict = {k.replace('model.', 'model.model.'): v for k, v in state_dict.items()}
+            _keys = model.load_state_dict(new_state_dict, strict=False)
+        if len(_keys.unexpected_keys) > 0:
+            new_state_dict = {k.replace('model.', 'base_model.model.model.'): v for k, v in state_dict.items()}
+            _keys = model.load_state_dict(new_state_dict, strict=False)
+
+        try:
+            assert len(_keys.unexpected_keys) == 0
+            print_header('*** All expected keys matched successfully ***')
+        except Exception as e:
+            print(e)
+            print_header('*** Error: unexpected keys in checkpoint - please fix ***')
+            print('Unexpected keys:')
+            for k in _keys.unexpected_keys:
+                print(k)
+            exit()
+
+    return model
+
+
 def load_model_from_checkpoint(attn_mlp_checkpoint_path: str = None,
                                finetune_checkpoint_path: str = None,
+                               model_config_path = None,
+                               finetune_config_path = None,
                                config_dir: str = './configs',
                                print_model: bool = False, 
                                debug: bool = False,
@@ -152,8 +194,23 @@ def load_model_from_checkpoint(attn_mlp_checkpoint_path: str = None,
     -> Assumes checkpoint_path stings have names for model_config and finetune_configs
     """
 
+
     # Load model configs
     if attn_mlp_checkpoint_path is not None:
+        if model_config_path is None: #NOTE: I Added this!
+            if len(attn_mlp_checkpoint_path.split('/')) == 4:
+                model_config = attn_mlp_checkpoint_path.split('/')[2]
+            else:
+                model_config = attn_mlp_checkpoint_path.split('/')[-1].split('-m=')[-1].split('-')[0]
+            model_config_path = join(config_dir, 'model', f'{model_config}.yaml')
+        
+
+        model_config = OmegaConf.load(model_config_path)
+        args = get_args_from_checkpoint(attn_mlp_checkpoint_path.split('/')[-1])
+        model_config = update_model_config_from_args(model_config, args)
+
+
+        """
         if len(attn_mlp_checkpoint_path.split('/')) == 4:
             model_config = attn_mlp_checkpoint_path.split('/')[2]
         else:
@@ -162,6 +219,7 @@ def load_model_from_checkpoint(attn_mlp_checkpoint_path: str = None,
         model_config = OmegaConf.load(model_config_path)
         args = get_args_from_checkpoint(attn_mlp_checkpoint_path.split('/')[-1])
         model_config = update_model_config_from_args(model_config, args)
+        """
     else:
         if len(finetune_checkpoint_path.split('/')) == 4:
             model_config = finetune_checkpoint_path.split('/')[2]
@@ -174,8 +232,9 @@ def load_model_from_checkpoint(attn_mlp_checkpoint_path: str = None,
         model_config['attention']['attention_type'] += '_profile'
 
     if finetune_checkpoint_path is not None:
-        finetune_config = finetune_checkpoint_path.split('-f=')[-1].split('-')[0]
-        finetune_config_path = join(config_dir, 'experiment', f'{finetune_config}.yaml')
+        if finetune_config_path is None:
+            finetune_config = finetune_checkpoint_path.split('-f=')[-1].split('-')[0]
+            finetune_config_path = join(config_dir, 'experiment', f'{finetune_config}.yaml')
         finetune_config = OmegaConf.load(finetune_config_path)
 
     if debug:
@@ -209,45 +268,63 @@ def load_model_from_checkpoint(attn_mlp_checkpoint_path: str = None,
     except KeyError:
         pass
 
-    if attn_mlp_checkpoint_path is not None:
-        # Update and load attentions
+    if not attn_mlp_checkpoint_path.endswith(".pt"):
         model = load_and_convert_attns(model, model_config,
-                                       checkpoint_path=attn_mlp_checkpoint_path)[0]
+                                        checkpoint_path=None)[0]
         if 'peft' in model_config['attention']:  # Merge back q and k proj
             model = model.merge_and_unload()
         # Already removed in load_and_convert_attns
         # model = remove_base_attention(model)  # , model_config.attention)
         model = toggle_attention(model, False)
-        if debug:
-            print_header('*** Model after attention converion ***')
-            print(model)
 
-    if finetune_checkpoint_path is not None:
-        # Update architecture with LoRAs
         if finetune_config.finetune.method == 'lora':
-            model, _ = create_peft_config(model, finetune_config.finetune)
-        else:
-            for p in model.parameters():
-                p.requires_grad = True
-    
-        # Load weights
-        state_dict = torch.load(finetune_checkpoint_path)['model_state_dict']
-        _keys = model.load_state_dict(state_dict, strict=False)
-        try:
-            assert len(_keys.unexpected_keys) == 0
-            print_header('*** All expected keys matched successfully ***')
-        except AssertionError:
-            print_header('*** Error: unexpected keys in checkpoint ***')
-            print('Unexpected keys:')
-            for k in _keys.unexpected_keys:
-                print(k)
-        if debug:
-            print_header('Missing keys:')
-            for k in _keys.missing_keys:
-                print(k)
-            print_header('Unexpected keys:')
-            for k in _keys.unexpected_keys:
-                print(k)
+                model, _ = create_peft_config(model, finetune_config.finetune)
+
+        model = load_hf_weights(
+            model, 
+            attn_mlp_checkpoint_path, finetune_checkpoint_path, 
+            filename="model.pt"
+        )
+    else:
+        if attn_mlp_checkpoint_path is not None:
+            # Update and load attentions
+            model = load_and_convert_attns(model, model_config,
+                                        checkpoint_path=attn_mlp_checkpoint_path)[0]
+            if 'peft' in model_config['attention']:  # Merge back q and k proj
+                model = model.merge_and_unload()
+            # Already removed in load_and_convert_attns
+            # model = remove_base_attention(model)  # , model_config.attention)
+            model = toggle_attention(model, False)
+            if debug:
+                print_header('*** Model after attention converion ***')
+                print(model)
+
+        if finetune_checkpoint_path is not None:
+            # Update architecture with LoRAs
+            if finetune_config.finetune.method == 'lora':
+                model, _ = create_peft_config(model, finetune_config.finetune)
+            else:
+                for p in model.parameters():
+                    p.requires_grad = True
+        
+            # Load weights
+            state_dict = torch.load(finetune_checkpoint_path)['model_state_dict']
+            _keys = model.load_state_dict(state_dict, strict=False)
+            try:
+                assert len(_keys.unexpected_keys) == 0
+                print_header('*** All expected keys matched successfully ***')
+            except AssertionError:
+                print_header('*** Error: unexpected keys in checkpoint ***')
+                print('Unexpected keys:')
+                for k in _keys.unexpected_keys:
+                    print(k)
+            if debug:
+                print_header('Missing keys:')
+                for k in _keys.missing_keys:
+                    print(k)
+                print_header('Unexpected keys:')
+                for k in _keys.unexpected_keys:
+                    print(k)
 
     try:
         # model = model.merge_and_unload()

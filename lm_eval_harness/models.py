@@ -1,13 +1,13 @@
 """
 Inherit from lm-evaluation-harness/lm_eval/models/huggingface.py to load linearized models
 """
-from lm_eval.models.huggingface import AutoCausalLM
+
+from .models_huggingface import AutoCausalLM
 from src.model.modeling_llama import LolcatsLlamaForCausalLM as LOLCATS_LLAMA_MODEL_CLASS
 from src.model.modeling_mistral import LolcatsMistralForCausalLM as LOLCATS_MISTRAL_MODEL_CLASS
 
 from src.model.modeling_llama import LooooolcatsLlamaForCausalLM as LOOOOOLCATS_LLAMA_MODEL_CLASS
 from src.model.modeling_mistral import LooooolcatsMistralForCausalLM as LOOOOOLCATS_MISTRAL_MODEL_CLASS
-
 from src.model.modeling_llama_sharded import ShardedLolcatsLlamaForCausalLM as SHARDED_LOLCATS_LLAMA_MODEL_CLASS
 
 
