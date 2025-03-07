@@ -21,3 +21,7 @@ from .linear_window_attention_tk_gen import (
     LolcatsWindowAttentionTKGen,
     LinearAttentionTKWindowGenerationCache
 )
+
+from .linear_window_attention_sw_sparse import (
+    LolcatsSparseSlidingWindowAttention
+)

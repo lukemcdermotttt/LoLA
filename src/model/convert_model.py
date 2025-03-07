@@ -126,6 +126,11 @@ def get_attention(attention_type: str, **kwargs: any):
         from .linear_attention import LolcatsSlidingWindowLongAttention
         return partial(LolcatsSlidingWindowLongAttention, **kwargs)
 
+    #NOTE: Added!
+    elif attention_type == 'lolcats_llama_window_sw_sparse':
+        from .linear_attention import LolcatsSparseSlidingWindow
+        return partial(LolcatsSparseSlidingWindow, **kwargs)
+
     ## TK generation build (requires Thunderkittens)
     elif attention_type == 'lolcats_llama_window_tk_gen':
         from .linear_attention import LolcatsWindowAttentionTKGen
