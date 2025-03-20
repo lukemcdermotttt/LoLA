@@ -10,10 +10,10 @@ import argparse
 import torch
 import numpy as np
 import pandas as pd
-
+import json 
 from load_model_for_eval import load_model_from_checkpoint, load_model_from_config
 
-LM_EVALUATION_HARNESS_PATH = '/home/ubuntu/linearattention/lm-evaluation-harness'  # Change this to where you clone LM eval harness from
+LM_EVALUATION_HARNESS_PATH = '/home/archy2/luke/lm-evaluation-harness'  # Change this to where you clone LM eval harness from
 
 RESULTS_PATH = '/home/ubuntu/linearattention/results/results_lm_eval.csv'
 
@@ -65,6 +65,8 @@ def get_args():
     parser.add_argument("--replicate", type=int, default=None)
     parser.add_argument("--model_config_path", type=str, default=None)
     parser.add_argument("--finetune_config_path", type=str, default=None)
+    parser.add_argument("--metadata", type=str, default="{}", 
+                        help="JSON string of custom metadata to pass to tasks (e.g. '{\"max_seq_lengths\":[4096,8192]}')")
     
     args = parser.parse_args()
 
@@ -148,6 +150,7 @@ def main():
     from lm_eval import evaluator
     
     args = get_args()
+    metadata = json.loads(args.metadata)
 
     try:
         # Save locally
@@ -187,11 +190,6 @@ def main():
         model = get_model('hf-causal-experimental').create_from_arg_string(
             '', {'cache_dir': args.cache_dir}
         )
-
-    
-    #NOTE: I ADDED THIS
-    if args.task == 'gsm8k':
-        print('Using gsm8k, using token fix thingy...')
 
     try: 
         device = model.device
@@ -233,13 +231,8 @@ def main():
         batch_size=args.batch_size,
         max_batch_size=args.max_batch_size,
         device=device,
-        no_cache=args.no_cache,
         limit=args.limit,
-        description_dict={},  # description_dict,
-        decontamination_ngrams_path=None,  # args.decontamination_ngrams_path,
-        check_integrity=None,  # args.check_integrity,
-        write_out=False,  # args.write_out,
-        output_base_path=None,  # args.output_base_path,
+        metadata=metadata
     )
 
     if args.task in ['mmlu', 'hendrycksTest', 'mmlu_cloze', 'mmlu_2']:

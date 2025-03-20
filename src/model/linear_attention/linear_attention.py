@@ -172,11 +172,23 @@ class LolcatsLinearAttention(nn.Module):
         
         self.rotary_emb = None
         if self.base_config is not None and self.rotary_config is None:
-            self.rotary_emb = base_attn.rotary_emb
+            try:
+                self.rotary_emb = base_attn.rotary_emb
+            except AttributeError:
+                # For transformers>=4.49, LlamaAttention no longer stores rotary_emb.
+                # Instead, we instantiate a new rotary embedding module.
+                from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+                self.rotary_emb = LlamaRotaryEmbedding(base_attn.config)
+                #head_dim=base_attn.head_dim,
+                #base=10000  # adjust this value if necessar
+        self.rotary_emb.to(base_attn.q_proj.weight.device)
 
         self.init_weights_(base_attn, remove_base_attn)
         self.init_feature_map_(feature_map, feature_map_kwargs,
                                learned_kernel, learned_kernel_kwargs)
+
+
+
 
     def init_feature_map_(self,
                           feature_map: str,
@@ -212,10 +224,10 @@ class LolcatsLinearAttention(nn.Module):
         """
         # Make other attributes accessible
         self.attention_dropout = 0  # We don't use dropout
-        self.hidden_size = base_attn.hidden_size
-        self.num_heads = base_attn.num_heads
+        self.hidden_size = base_attn.config.hidden_size
+        self.num_heads = base_attn.config.num_attention_heads
         self.head_dim = base_attn.head_dim
-        self.num_key_value_heads = base_attn.num_key_value_heads
+        self.num_key_value_heads = base_attn.config.num_key_value_heads
         self.num_key_value_groups = base_attn.num_key_value_groups
 
         self.q_shape = [self.num_heads, self.head_dim]

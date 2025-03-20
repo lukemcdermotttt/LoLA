@@ -15,11 +15,12 @@ from tqdm import tqdm
 from transformers import BatchEncoding
 
 from lm_eval import utils
-from lm_eval.base import BaseLM
+from lm_eval.api.model import TemplateLM #BaseLM
 
 TokenSequence = Union[List[int], torch.LongTensor, torch.Tensor, BatchEncoding]
 
 _DeviceMapping = NewType("DeviceMapping", Mapping[str, Union[int, str, torch.device]])
+
 
 
 def _get_accelerate_args(
@@ -61,7 +62,7 @@ def _get_dtype(
     return _torch_dtype
 
 
-class HuggingFaceAutoLM(BaseLM):
+class HFLM(TemplateLM):
     AUTO_CONFIG_CLASS: transformers.AutoConfig = transformers.AutoConfig
     AUTO_TOKENIZER_CLASS: transformers.AutoTokenizer = transformers.AutoTokenizer
     AUTO_MODEL_CLASS: transformers.AutoModel = None
@@ -510,7 +511,7 @@ class HuggingFaceAutoLM(BaseLM):
         return reorder.get_original(results)
 
 
-class AutoCausalLM(HuggingFaceAutoLM):
+class AutoCausalLM(HFLM):
     """Causal language modeling.
     You can find a set of supported models in the HF documentation:
     https://huggingface.co/docs/transformers/main/model_doc/auto#transformers.AutoModelForCausalLM
@@ -575,7 +576,7 @@ class AutoCausalLM(HuggingFaceAutoLM):
         )
 
 
-class AutoSeq2SeqLM(HuggingFaceAutoLM):
+class AutoSeq2SeqLM(HFLM):
     """Seq2Seq language modeling.
     You can find a set of supported models in the following documentation:
     https://huggingface.co/docs/transformers/main/model_doc/auto#transformers.AutoModelForSeq2SeqLM

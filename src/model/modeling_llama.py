@@ -71,6 +71,8 @@ class LolcatsLlamaModel(LlamaModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        use_cache = False #NOTE: ADDED
+        
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -148,7 +150,7 @@ class LolcatsLlamaModel(LlamaModel):
 
             hidden_states = layer_outputs[0]
 
-            if use_cache:
+            if use_cache: 
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
