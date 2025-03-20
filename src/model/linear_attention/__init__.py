@@ -25,3 +25,11 @@ from .linear_window_attention_tk_gen import (
 from .linear_window_attention_sw_sparse import (
     LolcatsSparseSlidingWindowAttention
 )
+
+from .linear_window_attention_sw_sparse_oracle import (
+    LolcatsSparseSlidingWindowAttentionOracle
+)
+
+from .linear_window_attention_sw_h0 import (
+    LolcatsSlidingWindowAttentionH0
+)

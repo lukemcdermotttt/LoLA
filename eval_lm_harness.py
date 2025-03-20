@@ -183,10 +183,15 @@ def main():
             path_to_lm_eval_harness=LM_EVALUATION_HARNESS_PATH,
         )
     elif args.model_type == 'huggingface':
-        from ..lm_eval.models import get_model
+        from lm_eval.models import get_model
         model = get_model('hf-causal-experimental').create_from_arg_string(
             '', {'cache_dir': args.cache_dir}
         )
+
+    
+    #NOTE: I ADDED THIS
+    if args.task == 'gsm8k':
+        print('Using gsm8k, using token fix thingy...')
 
     try: 
         device = model.device

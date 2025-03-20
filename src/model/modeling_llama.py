@@ -175,6 +175,7 @@ class LolcatsLlamaModel(LlamaModel):
 
 
 class LolcatsLlamaForCausalLM(LlamaForCausalLM):
+    
     """
     Wrapper for Llama-like autoregressive language model
     """
@@ -186,13 +187,16 @@ class LolcatsLlamaForCausalLM(LlamaForCausalLM):
             config.rope_scaling = None
         if getattr(config, 'pretraining_tp', None) is None:
             config.pretraining_tp = 1
+
         super().__init__(config)
         self.model = LolcatsLlamaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
         # Initialize weights and apply final processing
         self.post_init()
+        self.model.config.pad_token_id = self.model.config.eos_token_id
+
+
 
     def forward(self, *args: any, labels: Optional[torch.LongTensor] = None, **kwargs: any):
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)

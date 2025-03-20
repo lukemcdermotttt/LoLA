@@ -176,6 +176,8 @@ def hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor,
     f_q_f = f_q.float()
     f_k_f = f_k.float()
 
+    mask_causal = torch.ones((M, N), device=q.device).tril(N-M)
+
     # ---------------------------
     # Sparse mask for global attention
     # ---------------------------
@@ -184,7 +186,7 @@ def hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor,
 
     # Compute sliding window (sparse) attention scores.
     a_sm = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale  # shape: (B, H, M, N)
-    a_sm_masked = a_sm.masked_fill(~mask_window.bool(), mask_value)
+    a_sm_masked = a_sm.masked_fill(~mask_causal.bool(), mask_value)
     a_sm_max = a_sm_masked.amax(dim=-1, keepdim=True)
     a_sm_exp = torch.exp(a_sm - a_sm_max)
 
@@ -193,7 +195,7 @@ def hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor,
 
     #w_mask = mask_window * torch.ones((M, N), device=q.device).tril(M-N-window_size)[None, None, ...] #this should be like no sliding window.
     #w_mask instead of mask_window
-    scores = torch.sum(torch.abs(a_ln - a_sm_exp) * mask_window, dim=-2, keepdim=True) * mask_linear
+    scores = torch.sum(torch.abs(a_ln - a_sm_exp) * (mask_linear), dim=-2, keepdim=True) * mask_linear
     # Now scores has shape (B, H, 1, N) broadcasted to (B, H, M, N).
 
     topk = min(global_cache_size, k.size(-2))  # k.size(-2) == N
@@ -338,7 +340,7 @@ def old_hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor,
 # ---------------------
 # Attention layer class
 # ---------------------
-class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
+class LolcatsSparseSlidingWindowAttentionOracle(LolcatsLinearAttention):
     """
     Lolcats attention combining sliding window and linear attention
     """
