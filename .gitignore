@@ -164,5 +164,5 @@ cython_debug/
 wandb/
 Miniconda3-latest-Linux-x86_64.sh
 
-checkpoints/.
-data/.
+checkpoints/
+data/

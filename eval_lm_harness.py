@@ -14,8 +14,7 @@ import json
 from load_model_for_eval import load_model_from_checkpoint, load_model_from_config
 
 LM_EVALUATION_HARNESS_PATH = '/home/archy2/luke/lm-evaluation-harness'  # Change this to where you clone LM eval harness from
-
-RESULTS_PATH = '/home/ubuntu/linearattention/results/results_lm_eval.csv'
+RESULTS_PATH = '/home/archy2/luke/LoLA/results_lm_eval.csv'
 
 
 OPEN_LLM = [  # task, shots
@@ -190,6 +189,7 @@ def main():
         model = get_model('hf-causal-experimental').create_from_arg_string(
             '', {'cache_dir': args.cache_dir}
         )
+    
 
     try: 
         device = model.device
@@ -232,9 +232,10 @@ def main():
         max_batch_size=args.max_batch_size,
         device=device,
         limit=args.limit,
-        metadata=metadata
+        metadata=metadata,
     )
 
+    """
     if args.task in ['mmlu', 'hendrycksTest', 'mmlu_cloze', 'mmlu_2']:
         mmlu_accs = []
         for k, v in results['results'].items():
@@ -245,7 +246,8 @@ def main():
             results['results']['mmlu'] = {'acc': sum(mmlu_accs) / len(mmlu_accs)}
     
         print('MMLU RESULT:', results['results']['mmlu'])
-    print(results)
+    """
+    print(results['results'])
             
     if wandb is not None:
         wandb.log(results)
