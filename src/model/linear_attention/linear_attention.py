@@ -391,7 +391,7 @@ class LolcatsLinearAttention(nn.Module):
             y_true = self.o_proj(y_true)
             attn_weights = None
 
-        return y_true, attn_weights, past_key_value
+        return y_true, attn_weights #, past_key_value
 
 
 class LinearAttentionState(Cache):
