@@ -440,7 +440,8 @@ class HFLM(TemplateLM):
     def tok_encode_batch(self, strings: List[str]) -> TokenSequence:
         return self.tokenizer(
             strings,
-            padding=True,
+            padding="longest", #NOTE: CHANGED True,
+            truncation=True,
             add_special_tokens=self.add_special_tokens,
             return_tensors="pt",
         )
@@ -519,7 +520,7 @@ class AutoCausalLM(HFLM):
 
     AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
     AUTO_PEFT_CLASS = peft.PeftModel
-
+ 
     def _create_auto_tokenizer(
         self,
         *,

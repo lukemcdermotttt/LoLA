@@ -2,7 +2,7 @@
 Inherit from lm-evaluation-harness/lm_eval/models/huggingface.py to load linearized models.
 Using the new template LM interface (since the old “base LM” is gone).
 """
-from typing import Tuple, Union, List, Any
+from typing import Tuple, Union, List, Any, Optional
 import torch
 import torch.nn.functional as F
 from .models_huggingface import AutoCausalLM, AutoSeq2SeqLM
@@ -14,6 +14,8 @@ from src.model.modeling_mistral import LooooolcatsMistralForCausalLM as LOOOOOLC
 from src.model.modeling_llama_sharded import ShardedLolcatsLlamaForCausalLM as SHARDED_LOLCATS_LLAMA_MODEL_CLASS
 
 from tqdm import tqdm  # ensure tqdm is installed
+from .models_huggingface import stop_sequences_criteria
+from lm_eval import utils
 
 class LolcatsLlamaForCausalLM(AutoCausalLM):
     """
@@ -87,7 +89,9 @@ class LolcatsLlamaForCausalLM(AutoCausalLM):
         generated_tokens = self._model_generate(
             inputs=token_context,
             max_tokens=max_new_tokens,
-            stop=stop_sequences
+            stop=stop_sequences,
+            use_cache=False,
+            do_sample=False
         )
         generated_text = self.tok_decode(generated_tokens.tolist())[0]
         for stop_seq in stop_sequences:
@@ -95,6 +99,30 @@ class LolcatsLlamaForCausalLM(AutoCausalLM):
                 generated_text = generated_text.split(stop_seq)[0]
                 break
         return generated_text
+
+    def _model_generate(self, inputs, max_tokens: int, stop: Optional[List[str]] = None, **kwargs):
+        # Ensure that the context does not encroach into the `space` for the generation.
+        input_ids = inputs["input_ids"][:, -self.max_length:]
+        attention_mask = inputs["attention_mask"][:, -self.max_length:]
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+
+        stopping_criteria = stop_sequences_criteria(
+            self.tokenizer, stop, input_ids.shape[1], input_ids.shape[0]
+        )
+
+        kwargs.pop("use_cache", None)
+        generations = self.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_tokens,
+            stopping_criteria=stopping_criteria,
+            use_cache=False,
+            **kwargs
+        )
+        return utils.select_continuation_from_batch_left_padding(
+            generations, max_context_size=inputs["input_ids"].size(1)
+        )
 
     def loglikelihood_rolling(self, text: str, **kwargs) -> float:
         """
@@ -220,3 +248,4 @@ class LooooolcatsMistralForCausalLM(AutoCausalLM):
             return self._add_special_tokens
         else:
             return False
+

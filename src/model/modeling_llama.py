@@ -70,6 +70,7 @@ class LolcatsLlamaModel(LlamaModel):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         use_cache = False #NOTE: ADDED
         
