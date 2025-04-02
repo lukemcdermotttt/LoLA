@@ -101,7 +101,10 @@ def get_lm_eval_model(model_kwargs: dict,  # model_loader.loading_kwargs
         if 'mistral' in lm_kwargs['pretrained']:
             from lm_eval_harness.models import LolcatsMistralForCausalLM as ModelClass
         else:
+            #from lm_eval_harness.models import LolcatsLlamaForCausalLM as ModelClass
             from lm_eval_harness.models import LolcatsLlamaForCausalLM as ModelClass
+        
+        lm_kwargs.pop('pretrained_model_name_or_path') #NOTE: I ADDED
         lm = ModelClass.create_from_arg_string('', lm_kwargs)
     else:
         sys.path.append(path_to_lm_eval_harness)
@@ -343,8 +346,15 @@ def load_model_from_checkpoint(attn_mlp_checkpoint_path: str = None,
         for n, p in model.named_parameters():
             if p.requires_grad:
                 print(f'├── {n}.requires_grad: {p.requires_grad}')   
+    
+
     model.eval()
-    if lm_eval_model:
-        lm.model = model
-        model = lm
+    
+    if lm_eval_model: #NOTE: I ADDED THIS
+        from lm_eval.models.huggingface import HFLM
+        model = HFLM(pretrained=model) #NOTE: I Added this
+        #lm.model = model
+        #model = lm
+
+    
     return model, model_config, tokenizer

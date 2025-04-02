@@ -165,7 +165,7 @@ class LolcatsSlidingWindowAttention(LolcatsLinearAttention):
                                                           window_size=self.window_size)
                 attn_weights = a_pred
             else:
-                print('Happenign here')
+                
                 past_key_value.window_size = self.decode_window_size
                 if f_q.shape[2] == 1 and kv_seq_len > 1 and not self.training:  # Generating
                     assert use_cache is True
@@ -214,7 +214,7 @@ class LolcatsSlidingWindowAttention(LolcatsLinearAttention):
             # Concatenate heads and apply output projection
             y_true = y_true.transpose(1, 2).contiguous().view(b, l, self.hidden_size)
             y_true = self.o_proj(y_true)
-        return y_true, attn_weights #, past_key_value
+        return y_true, attn_weights, past_key_value
 
 
 class LinearAttentionSlidingWindowCache(LinearAttentionState):

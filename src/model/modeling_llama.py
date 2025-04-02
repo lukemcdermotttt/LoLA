@@ -72,7 +72,6 @@ class LolcatsLlamaModel(LlamaModel):
         )
 
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        use_cache = False #NOTE: ADDED
         
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
