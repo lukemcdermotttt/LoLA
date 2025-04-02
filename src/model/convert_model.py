@@ -134,6 +134,10 @@ def get_attention(attention_type: str, **kwargs: any):
     elif attention_type == 'lolcats_llama_window_sw_sparse_oracle':
         from .linear_attention import LolcatsSparseSlidingWindowAttentionOracle
         return partial(LolcatsSparseSlidingWindowAttentionOracle, **kwargs)
+    
+    elif attention_type == 'lolcats_llama_window_sw_sparse_prefill':
+        from .linear_attention import LolcatsSparsePrefillSlidingWindowAttention
+        return partial(LolcatsSparsePrefillSlidingWindowAttention, **kwargs)
 
 
     elif attention_type == 'lolcats_llama_window_sw_h0':
@@ -166,6 +170,10 @@ def get_attention_cache(attention_type: str, past_key_values: any = None):
         from .linear_attention import LinearAttentionTKWindowCache
         return LinearAttentionTKWindowCache()
 
+    elif 'llama_window_sw_sparse' in attention_type:
+        from .linear_attention import LinearAttentionSparseSlidingWindowCache
+        return LinearAttentionSparseSlidingWindowCache()
+    
     elif 'llama_window_sw' in attention_type:
         from .linear_attention import LinearAttentionSlidingWindowCache
         return LinearAttentionSlidingWindowCache()

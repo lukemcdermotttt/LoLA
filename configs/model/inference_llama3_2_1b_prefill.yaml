@@ -1,7 +1,7 @@
 name: llama
 model:
-  pretrained_model_name_or_path: "meta-llama/Meta-Llama-3.2-1B"
-  cache_dir: "/home/ubuntu/linearattention/results/" # Set this to where you want to save checkpoint weights 
+  pretrained_model_name_or_path: "meta-llama/Llama-3.2-1B"
+  cache_dir: "/home/archy2/luke/lolcats/checkpoints" # Set this to where you want to save checkpoint weights 
   return_dict: true
   load_in_8bit: false
   load_in_4bit: false
@@ -18,7 +18,7 @@ model:
     rope_type: llama3
 
 attention:
-  attention_type: lolcats_llama_window_sw_sparse
+  attention_type: lolcats_llama_window_sw_sparse_prefill
   state_chunk_len: 1024
   window_size: 64
   global_cache_size: 64

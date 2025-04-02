@@ -13,7 +13,7 @@ import pandas as pd
 
 from load_model_for_eval import load_model_from_checkpoint, load_model_from_config
 
-LM_EVALUATION_HARNESS_PATH = '/home/ubuntu/linearattention/lm-evaluation-harness'  # Change this to where you clone LM eval harness from
+LM_EVALUATION_HARNESS_PATH = '/home/archy2/luke/old-lm-eval/lm-evaluation-harness'  # Change this to where you clone LM eval harness from
 
 RESULTS_PATH = '/home/ubuntu/linearattention/results/results_lm_eval.csv'
 
@@ -241,7 +241,7 @@ def main():
         write_out=False,  # args.write_out,
         output_base_path=None,  # args.output_base_path,
     )
-
+    
     if args.task in ['mmlu', 'hendrycksTest', 'mmlu_cloze', 'mmlu_2']:
         mmlu_accs = []
         for k, v in results['results'].items():
