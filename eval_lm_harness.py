@@ -248,7 +248,7 @@ def main():
         print('MMLU RESULT:', results['results']['mmlu'])
     """
     print(results['results'])
-            
+    results = results['results']       
     if wandb is not None:
         wandb.log(results)
 

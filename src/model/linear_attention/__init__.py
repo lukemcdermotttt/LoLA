@@ -33,3 +33,7 @@ from .linear_window_attention_sw_sparse_oracle import (
 from .linear_window_attention_sw_h0 import (
     LolcatsSlidingWindowAttentionH0
 )
+
+from .linear_window_attention_sw_sparse_prefill import (
+    LolcatsSparsePrefillSlidingWindowAttention, LinearAttentionSparseSlidingWindowCache
+)

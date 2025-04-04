@@ -204,6 +204,7 @@ class LolcatsSlidingWindowAttention(LolcatsLinearAttention):
                                                          window_size=self.window_size,
                                                          kv_state=kv_state,
                                                          k_state=k_state)
+                    
                     # Save and update KV cache and states
                     # past_key_value.update(k, v.detach(), self.layer_idx,
                     #                       fmap_key_states=f_k.detach(),
