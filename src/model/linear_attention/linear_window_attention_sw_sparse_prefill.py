@@ -290,7 +290,7 @@ class LolcatsSparsePrefillSlidingWindowAttention(LolcatsLinearAttention):
                     #calculate errors for linear attention in sliding window 
                     f_k_sw = self.feature_map_k(k_cache[:,:,:self.window_size])
                     window_ln = torch.einsum('bhmd,bhnd->bhn', f_q.float(), f_k_sw.float())
-                    local_errors = torch.abs(window_ln-a_sm[:,:,0,:self.window_size]) * 0
+                    local_errors = torch.abs(window_ln/a_sm[:,:,0,:self.window_size]) * 0
 
                     past_key_value.update_scores(local_errors, self.layer_idx)
                     
@@ -394,15 +394,16 @@ class LinearAttentionSparseSlidingWindowCache(LinearAttentionState):
             H_idx = torch.arange(H,device=device)[None,:,None] # shape [1,H]
 
             local_scores, global_scores, global_cache_indices = global_cache
-            mask_for_global_cache = torch.zeros((B, H, N), dtype=torch.bool, device=device)
-            mask_for_global_cache[B_idx, H_idx, global_cache_indices] = True
-            
-            global_k_cache = key_states[mask_for_global_cache].view(B,H,global_cache_indices.size(-1),d)
-            global_v_cache = value_states[mask_for_global_cache].view(B,H,global_cache_indices.size(-1),d)
-            
-            fmap_key_states = fmap_key_states[~mask_for_global_cache].view(B,H,N-global_cache_indices.size(-1),fmap_key_states.size(-1))
-            key_states = key_states[~mask_for_global_cache].view(B,H,N-global_cache_indices.size(-1),d)
-            value_states = value_states[~mask_for_global_cache].view(B,H,N-global_cache_indices.size(-1),d)
+            if global_scores is not None:
+                mask_for_global_cache = torch.zeros((B, H, N), dtype=torch.bool, device=device)
+                mask_for_global_cache[B_idx, H_idx, global_cache_indices] = True
+                
+                global_k_cache = key_states[mask_for_global_cache].view(B,H,global_cache_indices.size(-1),d)
+                global_v_cache = value_states[mask_for_global_cache].view(B,H,global_cache_indices.size(-1),d)
+                
+                fmap_key_states = fmap_key_states[~mask_for_global_cache].view(B,H,N-global_cache_indices.size(-1),fmap_key_states.size(-1))
+                key_states = key_states[~mask_for_global_cache].view(B,H,N-global_cache_indices.size(-1),d)
+                value_states = value_states[~mask_for_global_cache].view(B,H,N-global_cache_indices.size(-1),d)
 
 
             # Decoding KV state (KV terms up to last window_size)
