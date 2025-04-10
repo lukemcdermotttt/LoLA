@@ -37,3 +37,7 @@ from .linear_window_attention_sw_h0 import (
 from .linear_window_attention_sw_sparse_prefill import (
     LolcatsSparsePrefillSlidingWindowAttention, LinearAttentionSparseSlidingWindowCache
 )
+
+from .linear_window_attention_sw_delta import (
+    LolcatsLinearSlidingWindowAttentionDelta
+)
