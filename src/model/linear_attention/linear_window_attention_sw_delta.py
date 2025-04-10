@@ -30,6 +30,9 @@ from .linear_attention import (
     softmax_attention
 )
 
+from fla.ops.delta_rule.chunk import chunk_delta_rule as delta_rule_dot_product  # adjust import as needed based on your build
+
+
 # ----------------------
 # Sliding window helpers
 # ----------------------
@@ -89,16 +92,6 @@ def hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor,
     return y, a  # attention weights only for the last chunk
 
 
-from typing import Tuple
-import torch
-import torch.nn.functional as F
-
-# Try to import the delta rule operator.
-# (Make sure that the operator is compiled and available in your environment)
-try:
-    from fla.ops.delta_rule.fused_chunk import fused_chunk_delta_rule as delta_rule_dot_product  # adjust import as needed based on your build
-except ModuleNotFoundError:
-    delta_rule_dot_product = None  # or raise an error if the delta rule operator is essential
 
 def under_window_delta_rule_attention(
     f_q: torch.Tensor, 
@@ -140,11 +133,12 @@ def under_window_delta_rule_attention(
     # Make sure to cast to float32 (for numerical robustness in the custom kernel)
     if delta_rule_dot_product is None:
         raise ImportError("Delta rule operator is not available. Ensure it is compiled and installed.")
-    qkv = linear_factor * delta_rule_dot_product(
-        f_q.contiguous().to(dtype=torch.float32),
-        f_k_delta.contiguous().to(dtype=torch.float32),
-        v_delta.contiguous().to(dtype=torch.float32)
-    ).to(dtype=dtype)
+    qkv, delta_final_state = delta_rule_dot_product(f_q.contiguous().to(dtype=torch.bfloat16),
+                        f_k_delta.contiguous().to(dtype=torch.bfloat16),
+                        v_delta.contiguous().to(dtype=torch.bfloat16),
+                        torch.ones_like(f_q.contiguous().to(dtype=torch.bfloat16)[..., 0]))
+    #qkv or delta_output is (b h t v)
+    qkv = (linear_factor * qkv).to(dtype=dtype)
 
     # Compute the normalization term in a similar fashion.
     # We perform a cumulative sum on the shifted f_k tensor:
@@ -218,10 +212,14 @@ def hybrid_attention_linear(q: torch.Tensor, k: torch.Tensor,
         qkv_sm, sum_qk_sm = sliding_window_softmax_attention(q, k, v, window_size, window_factor, mask_value)
 
     # 2. Under window (linear attention)
-    qkv_ln, sum_qk_ln = under_window_delta_rule_attention(f_q, f_k, v, window_size, linear_factor, eps)
+    #qkv_ln, sum_qk_ln = under_window_delta_rule_attention(f_q, f_k, v, window_size, linear_factor, eps)
 
+    #print('SIZES: sm,', qkv_sm.size(), sum_qk_sm.size())
+    #print('SIZES: delta,', qkv_ln.size(), sum_qk_ln.size())
+    #print()
     # 3. Combine
-    y = (qkv_sm + qkv_ln) / (sum_qk_sm + sum_qk_ln)
+    #y = (qkv_sm + qkv_ln) / (sum_qk_sm + 0*sum_qk_ln)
+    y = (qkv_sm) / (sum_qk_sm)
     return y, None
 
 
@@ -248,7 +246,7 @@ class LolcatsLinearSlidingWindowAttentionDelta(LolcatsLinearAttention):
         super().__init__(**kwargs)
         # Determine how we compute attentions
         self.linear_attention = hybrid_attention_linear
-        self.attention_type = 'lolcats_llama_window_sw'
+        self.attention_type = 'lolcats_llama_window_sw_delta'
         # Learnable factor for combining attentions
         self.affine_attention_factors = affine_attention_factors
         device, dtype = self.q_proj.weight.device, self.q_proj.weight.dtype
