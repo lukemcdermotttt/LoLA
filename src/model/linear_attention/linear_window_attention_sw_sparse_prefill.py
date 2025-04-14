@@ -63,6 +63,62 @@ def hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor,
     This version is refactored for memory efficiency using torch.matmul in place of einsum,
     while replicating the behavior of the original implementation exactly.
     """
+
+
+    """
+    TESTING BLOCK SPARSE LOLA, ASSUMING Y,A ARE MEANINGLESS ON NIAH.
+    """
+    block_size = 16 #HYPERPARAMETER
+
+    """
+    B, H, M, D = q.shape
+    _, _, N, _ = k.shape
+    scale = k.shape[-1] ** -0.5
+    
+
+
+    block_size = 4 #HYPERPARAMETER
+    q_f   = q.float()
+    k_f   = k.float()
+    f_q_f = f_q.float()
+    f_k_f = f_k.float()
+    dtype = q_f.dtype
+    mask_window, mask_linear = get_masks(window_size, M, N, q.device)
+
+    local_scores = torch.zeros((B,H,min(M,window_size)),device=q.device, dtype=dtype)
+    
+    if M <= global_cache_size:
+        y = torch.zeros_like(q_f, device=q.device, dtype=dtype)
+        a = torch.zeros((B,H,M,N),device=q.device, dtype=dtype)
+        global_scores = torch.ones((B,H,M),device=q.device, dtype=dtype)
+        top_indices = torch.arange(M,device=q.device).repeat(B,H,1)
+        global_cache = (local_scores, global_scores, top_indices)
+    else:
+        a_ln = torch.matmul(f_q_f, f_k_f.transpose(-2, -1))  # shape: (B, H, M, N)
+        a_sm = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale  # shape: (B, H, M, N)
+        a_sm_masked = a_sm.masked_fill(~mask_window.bool(), mask_value)
+        a_sm_max = a_sm_masked.amax(dim=-1, keepdim=True)
+        a_sm_exp = torch.exp(a_sm - a_sm_max)
+        a_diff = (a_ln - a_sm_exp).masked_fill(~mask_window.bool(), 0)
+        scores = torch.sum(a_diff, dim=-2)
+        
+        block_scores = torch.sum(scores[:,:,:N-(N%4)].view(B,H,-1,4), dim=-1)
+        block_scores, block_indices = torch.topk(block_scores, k=global_cache_size//block_size, dim=-1)
+        scores = block_scores.unsqueeze(-1).repeat(1,1,1,4).view(B,H,-1)
+        block = torch.arange(4, device=q.device).view(1, 1, 1, 4)
+        indices = block_indices.unsqueeze(-1) * 4 + block
+        indices = indices.view(B,H,-1)
+        global_cache = (local_scores, scores, indices)
+
+        y = q_f * 0
+        a = a_ln * 0
+
+
+    return y.to(torch.bfloat16), a, global_cache
+    """
+    
+
+    """EVERYTHING BELOW IS NORMAL"""
     B, H, M, D = q.shape
     _, _, N, _ = k.shape
     scale = k.shape[-1] ** -0.5
@@ -151,13 +207,24 @@ def hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor,
 
     if return_global_cache:
         if N > window_size:
+            
+            block_scores = torch.sum(scores[:,:,-1,:N-(N%block_size)].view(B,H,-1,block_size), dim=-1)
+            block_scores, block_indices = torch.topk(block_scores, k=global_cache_size//block_size, dim=-1)
+            scores = block_scores.unsqueeze(-1).repeat(1,1,1,block_size).view(B,H,-1)
+            block = torch.arange(block_size, device=q.device).view(1, 1, 1, block_size)
+            indices = block_indices.unsqueeze(-1) * block_size + block
+            indices = indices.view(B,H,-1)
+            global_cache = (local_scores, scores, indices)
+
+            """
             B,H,_,d = k_f.size()
             device = k_f.device
             B_idx = torch.arange(B,device=device)[:,None,None] # shape [B,1]
             H_idx = torch.arange(H,device=device)[None,:,None] # shape [1,H]
             global_scores, top_indices = torch.topk(scores[:,:,-1], k=topk, dim=-1)
             global_cache = (local_scores, global_scores, top_indices)
-
+            """
+            
             #mask = torch.ones((B, H, N), dtype=torch.bool, device=device)
             #mask[B_idx, H_idx, top_indices] = False
             #rest_f_k_f = f_k_f[mask].view(B, H, N - top_indices.size(-1), D)
@@ -335,7 +402,7 @@ class LolcatsSparsePrefillSlidingWindowAttention(LolcatsLinearAttention):
         return y_true, attn_weights, past_key_value
 
 
-class LinearAttentionSparseSlidingWindowCache(LinearAttentionState):
+class LinearAttentionSparsePrefillSlidingWindowCache(LinearAttentionState):
     """
     Class for `past_key_values`
     -> Alternative to KV cache; here we only maintain a "KV state" and "K state"
@@ -442,7 +509,7 @@ class LinearAttentionSparseSlidingWindowCache(LinearAttentionState):
                     self.global_v_cache.append(global_v_cache.to(dtype))
             else:
                 print('[OOPS!] Its updating recurrently!, havent touched this code! ')
-                
+                raise '[OOPS!] Its updating recurrently!, havent touched this code! '
                 # Update kv and k states recurrently
                 kv_state = (self.kv_states[layer_idx].to(kv_state.dtype) + kv_state).to(dtype)
                 k_state  = (self.k_states[layer_idx].to(kv_state.dtype) + k_state).to(dtype)

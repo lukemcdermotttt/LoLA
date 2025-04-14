@@ -35,7 +35,7 @@ from .linear_window_attention_sw_h0 import (
 )
 
 from .linear_window_attention_sw_sparse_prefill import (
-    LolcatsSparsePrefillSlidingWindowAttention, LinearAttentionSparseSlidingWindowCache
+    LolcatsSparsePrefillSlidingWindowAttention, LinearAttentionSparsePrefillSlidingWindowCache
 )
 
 from .linear_window_attention_sw_baseline import (
