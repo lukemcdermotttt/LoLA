@@ -32,6 +32,12 @@ def get_pretrained_loader(pretrained_model_name_or_path: str,
             huggingface_token=huggingface_token,
             **model_kwargs,
         )
+    elif 'hi' in pretrained_model_name_or_path:  # Phi or phi
+        return PretrainedPhiLoader(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            huggingface_token=huggingface_token,
+            **model_kwargs,
+        )
     else:
         print(f'-> {pretrained_model_name_or_path} using default pretrained model loader')
         return PretrainedModelLoader(
@@ -180,6 +186,38 @@ class PretrainedMistralLoader(PretrainedModelLoader):
             from .modeling_mistral import LooooolcatsMistralForCausalLM as model_class
         elif 'lolcats_llama' in model_type:
             from .modeling_mistral import LolcatsMistralForCausalLM as model_class
+        else:
+            if model_type == 'flash_attention_2':
+                self.loading_kwargs['attn_implementation'] = model_type
+            from transformers import AutoModelForCausalLM as model_class
+            print('-> Loading from AutoModelForCausalLM')
+            
+        model = model_class.from_pretrained(**self.loading_kwargs)
+        if self.peft_id is not None:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(
+                model, 
+                self.peft_id,
+                torch_dtype=self.loading_kwargs['torch_dtype'],
+                device_map='auto',
+                cache_dir=self.loading_kwargs['cache_dir'],
+            ).merge_and_unload()
+            
+        if self.quantization:
+            model = prepare_model_for_kbit_training(
+                model, use_gradient_checkpointing=self.gradient_checkpointing,
+                gradient_checkpointing_kwargs={'use_reentrant': False},
+            )
+        return model
+
+
+
+class PretrainedPhiLoader(PretrainedModelLoader):
+    def load(self, model_type: str = None):
+        if model_type is None:
+            from transformers import PhiCausalLM as model_class
+        elif 'lolcats_llama' in model_type:
+            from .modeling_phi import LolcatsPhiForCausalLM as model_class
         else:
             if model_type == 'flash_attention_2':
                 self.loading_kwargs['attn_implementation'] = model_type

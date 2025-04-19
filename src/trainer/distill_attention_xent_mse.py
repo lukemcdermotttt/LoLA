@@ -51,7 +51,6 @@ class OurTrainer(DefaultTrainer):
         softmax_layers = []
         for layer_idx, attns in enumerate(outputs):
             if attns is not None:
-                print('attns', len(attns))
                 if len(attns) != 2:
                     attns = attns.cpu()
                 else:
@@ -65,7 +64,6 @@ class OurTrainer(DefaultTrainer):
                         a_true = a_true.contiguous().view(-1, k_len)
                         loss_xent += self.criterion_xent(a_pred, a_true)
                     if self.mse_factor > 0:
-                        print('mse',len(attns[1]), attns[1][0].size(), attns[1][1].size())
                         loss_mse += self.criterion_mse(*attns[1])
                     n_layers += 1
             else:
@@ -74,7 +72,6 @@ class OurTrainer(DefaultTrainer):
             loss_xent = loss_xent / n_layers * self.xent_factor
             loss_mse = loss_mse / n_layers * self.mse_factor
         loss = loss_xent + loss_mse
-        print('loss xent, mse', loss_xent, loss_mse)
         if 'position_ids' in data:
             outputs = {'loss_xent': loss_xent.item() if self.xent_factor > 0 else 0,
                        'loss_mse': loss_mse.item() if self.mse_factor > 0 else 0,

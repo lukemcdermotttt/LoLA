@@ -74,6 +74,7 @@ def rotate_half(x):
 # Copied from transformers.models.mistral.modeling_mistral (llama.modeling_llama at v4.36)
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors."""
+
     if position_ids is not None:
         cos, sin = cos[position_ids], sin[position_ids]
     cos = cos.unsqueeze(unsqueeze_dim)

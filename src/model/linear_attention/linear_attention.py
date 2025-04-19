@@ -244,7 +244,11 @@ class LolcatsLinearAttention(nn.Module):
         self.q_proj = base_attn.q_proj
         self.k_proj = base_attn.k_proj
         self.v_proj = base_attn.v_proj
-        self.o_proj = base_attn.o_proj
+        try:
+            self.o_proj = base_attn.o_proj
+        except:
+            #If using Phi 1.5
+            self.o_proj = base_attn.dense
         try:  # If wanting to use FA2 for ground-truth inference
             self._flash_attn_uses_top_left_mask = base_attn._flash_attn_uses_top_left_mask
         except AttributeError: 
@@ -284,12 +288,33 @@ class LolcatsLinearAttention(nn.Module):
         # Apply rotary embeddings and repeat for GQA
         if position_ids is not None and kv_seq_len <= position_ids[0, -1]:
             kv_seq_len = position_ids[0, -1] + 1  # hack for adjusting position ids
-        try: # As in Transformers v4.36
-            cos, sin = self.rotary_emb(k, seq_len=kv_seq_len)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-        except TypeError:  # As in Transformers v4.39+
-            cos, sin = self.rotary_emb(v, position_ids)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        
+        #FOR PHI
+        if self.rotary_emb.dim*2 == q.size(-1):
+            cos, sin = self.rotary_emb(v, seq_len=kv_seq_len)
+            
+            query_rot, query_pass = (
+                q[..., : self.rotary_emb.dim],
+                q[..., self.rotary_emb.dim :],
+            )
+            key_rot, key_pass = (
+                k[..., : self.rotary_emb.dim],
+                k[..., self.rotary_emb.dim :],
+            )
+            # [batch_size, seq_length, num_heads, head_dim // config.partial_rotary_factor]
+            query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, position_ids)
+
+            # [batch_size, seq_length, num_heads, head_dim]
+            q = torch.cat((query_rot, query_pass), dim=-1)
+            k = torch.cat((key_rot, key_pass), dim=-1)
+        #FOR ALL ELSE
+        else:
+            try: # As in Transformers v4.36
+                cos, sin = self.rotary_emb(k, seq_len=kv_seq_len)
+                q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+            except TypeError:  # As in Transformers v4.39+
+                cos, sin = self.rotary_emb(v, position_ids)
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         k = repeat_kv(k, self.num_key_value_groups)
         v = repeat_kv(v, self.num_key_value_groups)

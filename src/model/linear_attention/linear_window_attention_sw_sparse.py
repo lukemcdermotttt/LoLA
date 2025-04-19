@@ -22,7 +22,7 @@ from .linear_attention import (
     softmax_attention
 )
 
-
+from einops import rearrange
 
 
 
@@ -42,109 +42,129 @@ def get_masks(window_size: int, q_len: int, k_len: int,
     return window_mask[None, None, ...], linear_mask[None, None, ...]
 
 
-def LoLA_quadratic(q: torch.Tensor, k: torch.Tensor, 
-                               f_q: torch.Tensor, f_k: torch.Tensor,
-                               v: torch.Tensor,
-                               window_factor: torch.Tensor,
-                               linear_factor: torch.Tensor,
-                               window_size: int,
-                               kv_state: torch.Tensor = None,
-                               k_state: torch.Tensor = None,
-                               eps: float = 1e-12,
-                               mask_value: float = -1e8,
-                               global_cache_size: int = 16):
+# ---------------------------------------------------------------------------
+# Fast LoLA sparse attention – API‑compatible wrapper
+# ---------------------------------------------------------------------------
+# Requires: flash-attn  (pip install flash-attn --no-build-isolation)
+
+import torch
+from flash_attn import flash_attn_func
+from einops import rearrange
+
+# ------ core routine: sliding‑window  +  residual‑top‑k  +  linear ----------
+def _lola_core(q, k, v, fq, fk, *, chunk, cache):
     """
-    Hybrid attention that combines local sparse (sliding window) attention,
-    global sparse attention, and low-rank (linear) attention.
+    q,k,v : [B, L, H,  D]
+    fq,fk : [B, L, H, 2D]
+    Returns : y  [B, L, H, D]
     """
-    B, H, M, D = q.shape
-    _, _, N, _ = k.shape
-    scale = k.shape[-1] ** -0.5
+    B, L, H, D = q.shape
+    C, G       = chunk, cache
+    N          = L // C
+    scale      = D ** -0.5
+    dev        = q.device
 
-    # Get the initial masks (assumed to be tensors of shape [B, H, M, N])
-    mask_window, mask_linear = get_masks(window_size, M, N, q.device)
+    # chunk views ------------------------------------------------------------
+    q_c  = rearrange(q,  'b (n c) h d -> b h n c d', c=C)
+    k_c  = rearrange(k,  'b (n c) h d -> b h n c d', c=C)
+    v_c  = rearrange(v,  'b (n c) h d -> b h n c d', c=C)
+    fq_c = rearrange(fq, 'b (n c) h f -> b h n c f', c=C)
+    fk_c = rearrange(fk, 'b (n c) h f -> b h n c f', c=C)
 
-    # Pre-cast inputs to float once.
-    q_f   = q.float()
-    k_f   = k.float()
-    f_q_f = f_q.float()
-    f_k_f = f_k.float()
+    k_flat  = rearrange(k_c,  'b h n c d -> b h (n c) d')
+    v_flat  = rearrange(v_c,  'b h n c d -> b h (n c) d')
+    fk_flat = rearrange(fk_c, 'b h n c f -> b h (n c) f')
 
-    # ---------------------------
-    # Sparse mask for global attention
-    # ---------------------------
-    # Compute low-rank attention scores.
-    a_ln = torch.matmul(f_q_f, f_k_f.transpose(-2, -1))  # shape: (B, H, M, N)
+    K_cache = torch.zeros((B, H, G, D),   device=dev, dtype=q.dtype)
+    V_cache = torch.zeros_like(K_cache)
+    FK_cache= torch.zeros((B, H, G, 2*D), device=dev, dtype=q.dtype)
 
-    # Compute sliding window (sparse) attention scores.
-    a_sm = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale  # shape: (B, H, M, N)
-    a_sm_masked = a_sm.masked_fill(~mask_window.bool(), mask_value)
-    a_sm_max = a_sm_masked.amax(dim=-1, keepdim=True)
-    a_sm_exp = torch.exp(a_sm - a_sm_max)
+    S_h = torch.zeros((B, H, 2*D, D), device=dev, dtype=torch.float32)
+    S_s = torch.zeros((B, H, 2*D),    device=dev, dtype=torch.float32)
 
-    # Compute scores exactly as in the old implementation.
-    # Sum over the query dimension (dim=-2) with keepdim and broadcast by mask_linear.
-    scores = torch.sum(torch.abs(a_ln - a_sm_exp) * mask_window, dim=-2, keepdim=True) * mask_linear
-    # Now scores has shape (B, H, 1, N) broadcasted to (B, H, M, N).
+    y_out = torch.empty_like(q)
 
-    topk = min(global_cache_size, k.size(-2))  # k.size(-2) == N
-    _, topk_indices = torch.topk(scores, k=topk, dim=-1)
-    # Create a sparse mask of the same shape as scores.
-    mask_sparse = torch.zeros_like(scores, dtype=torch.int, device=q.device)
-    mask_sparse.scatter_(-1, topk_indices, 1)
-    mask_sparse = mask_sparse * mask_linear  # elementwise multiplication
+    for n in range(N):
+        qn, kn, vn = q_c[:, :, n], k_c[:, :, n], v_c[:, :, n]
+        km1 = k_c[:, :, n-1] if n else torch.zeros_like(kn)
+        vm1 = v_c[:, :, n-1] if n else torch.zeros_like(vn)
 
-    # Update masks as in the original.
-    mask_window = mask_window + mask_sparse
-    mask_linear = mask_linear - mask_sparse
+        # ---- Flash‑Attention over window (km1 | kn) + current cache -------
+        K_block = torch.cat([km1, kn, K_cache], dim=2)      # [B,H,2C+G,D]
+        V_block = torch.cat([vm1, vn, V_cache], dim=2)
 
-    # ---------------------------
-    # Compute final attention components using updated masks.
-    # ---------------------------
-    # 1. Sliding window (softmax) attention
-    a_sm = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale
-    a_sm = a_sm.masked_fill(~mask_window.bool(), mask_value)
-    a_sm_max = a_sm.amax(dim=-1, keepdim=True)
-    a_sm = window_factor * torch.exp(a_sm - a_sm_max)
-    sum_sm = a_sm.sum(dim=-1, keepdim=True)
+        yw = flash_attn_func(
+            rearrange(qn,     'b h c d -> (b h) c 1 d'),
+            rearrange(K_block,'b h s d -> (b h) s 1 d'),
+            rearrange(V_block,'b h s d -> (b h) s 1 d'),
+            causal=False
+        )
+        yw = rearrange(yw, '(b h) c 1 d -> b h c d', b=B, h=H)
 
-    # 2. Linear (low-rank) attention
-    a_ln = torch.matmul(f_q_f, f_k_f.transpose(-2, -1))
-    a_ln = linear_factor * a_ln.masked_fill(~mask_linear.bool(), 0)
-    sum_ln = a_ln.sum(dim=-1, keepdim=True)
+        # ---- linear remainder (current S_h,S_s) --------------------------
+        y_lin  = torch.einsum('b h c f, b h f d -> b h c d', fq_c[:, :, n].float(), S_h)
+        yy     = yw + y_lin
 
-    # 3. Combine to compute attention weights.
-    a = ((a_sm + a_ln) / (sum_sm + sum_ln + eps)).to(q.dtype)
+        # ---- residual projection → compute top‑G -------------------------
+        resid  = (yy.mean(2)).float()                       # [B,H,D]
+        seen   = (n+1)*C
+        score  = torch.einsum('b h d, b h l d -> b h l',
+                              resid, v_flat[:, :, :seen].float()).abs()
+        topG   = score.topk(min(G, seen), dim=-1).indices   # [B,H,G']
 
-    # Compute output.
-    y = torch.matmul(a_sm + a_ln, v.float())
-    if kv_state is not None:
-        y += linear_factor * torch.matmul(f_q_f, kv_state.float())
-        sum_ln = sum_ln + linear_factor * torch.matmul(f_q_f, k_state.float().unsqueeze(-1))
-    y = (y / (sum_sm + sum_ln + eps)).to(q.dtype)
-    return y, a
+        bidx = torch.arange(B, device=dev)[:, None, None]
+        hidx = torch.arange(H, device=dev)[None, :, None]
 
+        K_cache = k_flat[bidx, hidx, topG].to(q.dtype)
+        V_cache = v_flat[bidx, hidx, topG].to(q.dtype)
+        FK_cache= fk_flat[bidx, hidx, topG].to(q.dtype)
 
+        # update running sums
+        S_h = torch.einsum('b h g f, b h g d -> b h f d', FK_cache.float(),
+                                                               V_cache.float())
+        S_s = FK_cache.float().sum(2)
 
-# ----------------------
-# Sliding window helpers
-# ----------------------
-def get_masks(window_size: int, q_len: int, k_len: int, 
-              device: torch.device) -> tuple[torch.Tensor]:
+        # write result
+        y_out[:, n*C:(n+1)*C] = rearrange(yy, 'b h c d -> b c h d')
+
+    return y_out
+# ---------------------------------------------------------------------------
+def lola_sparse_compatible(
+        q: torch.Tensor, k: torch.Tensor,
+        f_q: torch.Tensor, f_k: torch.Tensor,
+        v: torch.Tensor,
+        window_factor: torch.Tensor,
+        linear_factor: torch.Tensor,
+        window_size: int,
+        kv_state: torch.Tensor = None,
+        k_state:  torch.Tensor = None,
+        eps: float = 1e-12,
+        mask_value: float = -1e8,
+        global_cache_size: int = 16):
     """
-    Return masks for softmax and linear attention terms
-    -> 1 is include, 0 is ignore
+    Same signature as `old_hybrid_attention_quadratic`.
+    Uses the fast LoLA path; returns (y, None).
     """
-    kwargs = {'device': device, 'dtype': int}
-    causal_mask = torch.ones((q_len, k_len), **kwargs).tril(k_len - q_len)
-    linear_mask = torch.ones((q_len, k_len), **kwargs).tril(k_len - q_len - window_size)
-    window_mask = causal_mask - linear_mask
-    # Return softmax mask (window), linear attention mask
-    # -> shapes broadcast over (b, h, q_len, k_len)
-    return window_mask[None, None, ...], linear_mask[None, None, ...]
+    # factors not used by the fast kernel – keep API stable
+    _ = (window_factor, linear_factor, kv_state, k_state, eps, mask_value)
+
+    # old API expects (B, H, M, D) ; fast path wants (B, M, H, D)
+    y_fast = _lola_core(
+        q.permute(0, 2, 1, 3).contiguous(),
+        k.permute(0, 2, 1, 3).contiguous(),
+        v.permute(0, 2, 1, 3).contiguous(),
+        f_q.permute(0, 2, 1, 3).contiguous(),
+        f_k.permute(0, 2, 1, 3).contiguous(),
+        chunk=window_size,
+        cache=global_cache_size
+    )
+
+    # reshape back to original layout and dtype
+    y_out = y_fast.permute(0, 2, 1, 3).contiguous().to(q.dtype)
+    return y_out, None
 
 
-def hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor, 
+def old_hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor, 
                                f_q: torch.Tensor, f_k: torch.Tensor,
                                v: torch.Tensor,
                                window_factor: torch.Tensor,
@@ -235,106 +255,6 @@ def hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor,
 
 
 
-
-def somewhat_old_hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor, 
-                               f_q: torch.Tensor, f_k: torch.Tensor,
-                               v: torch.Tensor,
-                               window_factor: torch.Tensor,
-                               linear_factor: torch.Tensor,
-                               window_size: int,
-                               kv_state: torch.Tensor = None,
-                               k_state: torch.Tensor = None,
-                               eps: float = 1e-12,
-                               mask_value: float=-1e8,
-                               global_cache_size: int=16):
-    
-    #Hybrid attention combining local sparse attention (sliding window), global sparse attention, and low rank attention (linear attention)
-
-    #Hack to get the right mask.
-    mask_window, mask_linear = get_masks(window_size, q.shape[-2], k.shape[-2], q.device)
-    
-    a_ln = torch.einsum('bhmd,bhnd->bhmn', f_q.float(), f_k.float())
-    a_sm = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * (k.shape[-1] ** -0.5)
-    a_sm_max = torch.amax(a_sm.masked_fill(~mask_window.bool(), mask_value), dim=-1, keepdim=True) #max in sliding window only.
-    a_sm = torch.exp(a_sm - a_sm_max)
-
-    scores = torch.sum(torch.abs(a_ln - a_sm)*mask_window, dim=-2, keepdims=True).expand(a_sm.size()) * mask_linear
-
-    topk_vals, topk_indices = torch.topk(scores, k=min(global_cache_size,k.size(-2)), dim=-1)
-    mask_sparse = torch.zeros_like(scores, dtype=torch.int, device=q.device).scatter_(-1, topk_indices, 1) * mask_linear
-    mask_window = mask_window + mask_sparse
-    mask_linear = mask_linear - mask_sparse
-    
-
-    #NOTE: Stich correct implementation below
-    #mask_window, mask_linear = get_masks(window_size, q.shape[-2], k.shape[-2], q.device)
-
-    # 1. Sliding window (softmax attention)
-    a_sm = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * (k.shape[-1] ** -0.5)
-    a_sm = a_sm.masked_fill(~mask_window.bool(), mask_value)
-    # torch.softmax(a_sm, dim=-1), but we account for the max when combining
-    a_sm_max = torch.amax(a_sm, dim=-1, keepdim=True)
-    a_sm   = window_factor * torch.exp(a_sm - a_sm_max)
-    sum_sm = a_sm.sum(dim=-1, keepdim=True)
-
-    # 2. Under window (linear attention)
-    a_ln = torch.einsum('bhmd,bhnd->bhmn', f_q.float(), f_k.float())
-    a_ln = linear_factor * a_ln.masked_fill(~mask_linear.bool(), 0)
-    sum_ln = a_ln.sum(dim=-1, keepdim=True)
-
-    # 3. Combine
-    a = ((a_sm + a_ln) / (sum_sm + sum_ln)).to(q.dtype)  # Save attention weights
-    # Allow outputs to also depend on prior kv_state and k_state
-    y = torch.einsum('bhmn,bhnd->bhmd', a_sm + a_ln, v.float())
-    if kv_state is not None:  # Combine with prior kv_state and k_state
-        y += linear_factor * torch.einsum('bhld,bhdf->bhlf', f_q.float(), kv_state.float())
-        sum_ln += linear_factor * torch.einsum(
-            'bhld,bhnd->bhl', f_q.float(), k_state.float())[..., None]
-    y = (y / (sum_sm + sum_ln)).to(q.dtype)
-    return y, a  # attention weights only for the last chunk
-
-
-def old_hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor, 
-                               f_q: torch.Tensor, f_k: torch.Tensor,
-                               v: torch.Tensor,
-                               window_factor: torch.Tensor,
-                               linear_factor: torch.Tensor,
-                               window_size: int,
-                               kv_state: torch.Tensor = None,
-                               k_state: torch.Tensor = None,
-                               eps: float = 1e-12,
-                               mask_value: float=-1e8):
-    """
-    Hybrid attention combining sliding window and linear attentions
-    """
-
-    mask_window, mask_linear = get_masks(window_size, q.shape[-2], k.shape[-2], q.device)
-
-    # 1. Sliding window (softmax attention)
-    a_sm = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * (k.shape[-1] ** -0.5)
-    a_sm = a_sm.masked_fill(~mask_window.bool(), mask_value)
-    # torch.softmax(a_sm, dim=-1), but we account for the max when combining
-    a_sm_max = torch.amax(a_sm, dim=-1, keepdim=True)
-    a_sm   = window_factor * torch.exp(a_sm - a_sm_max)
-    sum_sm = a_sm.sum(dim=-1, keepdim=True)
-
-    # 2. Under window (linear attention)
-    a_ln = torch.einsum('bhmd,bhnd->bhmn', f_q.float(), f_k.float())
-    a_ln = linear_factor * a_ln.masked_fill(~mask_linear.bool(), 0)
-    sum_ln = a_ln.sum(dim=-1, keepdim=True)
-
-    # 3. Combine
-    a = ((a_sm + a_ln) / (sum_sm + sum_ln)).to(q.dtype)  # Save attention weights
-    # Allow outputs to also depend on prior kv_state and k_state
-    y = torch.einsum('bhmn,bhnd->bhmd', a_sm + a_ln, v.float())
-    if kv_state is not None:  # Combine with prior kv_state and k_state
-        y += linear_factor * torch.einsum('bhld,bhdf->bhlf', f_q.float(), kv_state.float())
-        sum_ln += linear_factor * torch.einsum(
-            'bhld,bhnd->bhl', f_q.float(), k_state.float())[..., None]
-    y = (y / (sum_sm + sum_ln)).to(q.dtype)
-    return y, a  # attention weights only for the last chunk
-
-
 # ---------------------
 # Attention layer class
 # ---------------------
@@ -360,7 +280,7 @@ class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
         super().__init__(**kwargs)
         self.attention_type = kwargs['attention_type']  #  'hedgehog_llama_window_sw'
         # Determine how we compute attentions
-        self.quadratic_attention = hybrid_attention_quadratic
+        self.quadratic_attention = lola_sparse_compatible
         self.attention_type = kwargs['attention_type']  # 'hedgehog_long_llama_window_sw'
         # Learnable factor for combining attentions
         self.affine_attention_factors = affine_attention_factors
@@ -425,6 +345,7 @@ class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
             else:
                 past_key_value.window_size = self.decode_window_size
                 if f_q.shape[2] == 1 and kv_seq_len > 1 and not self.training:  # Generating
+                    raise 'GENERATING, THIS FILE DOESNT SUPPORT THIS YET.'
                     assert use_cache is True
                     _kv = past_key_value.update_for_decoding(k, v, self.layer_idx,
                                                              self.feature_map_k,
