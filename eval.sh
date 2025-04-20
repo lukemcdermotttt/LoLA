@@ -1,6 +1,6 @@
-distill_checkpoint="./checkpoints/distill_llama3_2_1b_delta/dl-d=no_distill_alpaca_clean-m=distill_llama3_2_1b_delta-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1-se=0-re=0_ft.pt" #"./checkpoints/distill_llama3_2_1b_delta/dl-d=no_distill_alpaca_clean-m=distill_llama3_2_1b_delta-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1-se=0-re=0_ft_1000.pt" #"./checkpoints/distill_llama3_2_1b_lk_smd_wsw64_fd64_w01/dl-d=distill_alpaca_clean_xent0_mse1000_lr1e-2-m=distill_llama3_2_1b_lk_smd_wsw64_fd64_w01-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1_distill.pt" #"/home/archy2/luke/lolcats/checkpoints/llama3_1b_prune_d64/llama3_1b_D64_dense-se=0-re=0-lzi=1_distill.pt"
-finetune_checkpoint="./checkpoints/distill_llama3_2_1b_delta/dl-d=no_distill_alpaca_clean-m=distill_llama3_2_1b_delta-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1-se=0-re=0_ft.pt" #"./checkpoints/distill_llama3_2_1b_delta/dl-d=no_distill_alpaca_clean-m=distill_llama3_2_1b_delta-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1-se=0-re=0_ft_1000.pt" #"./checkpoints/distill_llama3_2_1b_lk_smd_wsw64_fd64_w01/dl-d=dacxmldl21lswfwflqac000_lzi=1_distill1d-m=distill_llama3_2_1b_lk_smd_wsw64_fd64_w01-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1-se=0-re=0_ft.pt"  #"/home/archy2/luke/lolcats/checkpoints/llama3_1b_prune_d64_SW/llama3_1b_D64_dense_SW_finetune-se=0-re=0-lzi=1-se=0-re=0_ft.pt" #"/home/archy2/luke/lolcats/checkpoints/llama3_1b_prune_d64/llama3_1b_D64_dense_finetune-se=0-re=0-lzi=1-se=0-re=0_ft.pt"
-model_config_path="configs/model/distill_llama3_2_1b_delta.yaml" #"configs/model/inference_llama3_2_1b_prefill.yaml" #"configs/model/inference_llama3_2_1b_global=0_local=64.yaml" #"configs/model/inference_llama3_2_1b_global=0_local=0.yaml"
+distill_checkpoint="./checkpoints/distill_llama3_2_1b_lk_smd_wsw64_fd64_w01/dl-d=distill_alpaca_clean_xent0_mse1000_lr1e-2-m=distill_llama3_2_1b_lk_smd_wsw64_fd64_w01-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1_distill.pt" #"/home/archy2/luke/lolcats/checkpoints/llama3_1b_prune_d64/llama3_1b_D64_dense-se=0-re=0-lzi=1_distill.pt"
+finetune_checkpoint="./checkpoints/distill_llama3_2_1b_lk_smd_wsw64_fd64_w01/dl-d=dacxmldl21lswfwflqac000_lzi=1_distill1d-m=distill_llama3_2_1b_lk_smd_wsw64_fd64_w01-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1-se=0-re=0_ft.pt"  #"/home/archy2/luke/lolcats/checkpoints/llama3_1b_prune_d64_SW/llama3_1b_D64_dense_SW_finetune-se=0-re=0-lzi=1-se=0-re=0_ft.pt" #"/home/archy2/luke/lolcats/checkpoints/llama3_1b_prune_d64/llama3_1b_D64_dense_finetune-se=0-re=0-lzi=1-se=0-re=0_ft.pt"
+model_config_path="configs/model/inference_llama3_2_1b_prefill.yaml" #"configs/model/inference_llama3_2_1b_prefill.yaml" #"configs/model/inference_llama3_2_1b_global=0_local=64.yaml" #"configs/model/inference_llama3_2_1b_global=0_local=0.yaml"
 
 
 #1B SW DISTILL CHECKPOINT: ./checkpoints/distill_llama3_2_1b_lk_smd_wsw64_fd64_w01/dl-d=distill_alpaca_clean_xent0_mse1000_lr1e-2-m=distill_llama3_2_1b_lk_smd_wsw64_fd64_w01-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1_distill.pt
@@ -16,9 +16,10 @@ python eval_lm_harness.py \
 --finetune_checkpoint_path $finetune_checkpoint \
 --model_config_path $model_config_path \
 --finetune_config_path 'configs/experiment/finetune_lora_qkvo_alpaca_clean.yaml' \
---task arc_easy --num_shots 0 --verbose --no_cache \
+--task lambada_openai --num_shots 0 --verbose --no_cache \
 --project_name lolcat \
 --wandb_entity lmcdermo
+
 
 #Llama 1B w/ sliding window
 #python eval_lm_harness.py \

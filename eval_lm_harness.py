@@ -224,7 +224,7 @@ def main():
         tasks = sorted([k for k in TASK_REGISTRY.keys() if f'{args.task}-' in k])
     else:
         tasks = [args.task]
-
+        
     results = evaluator.simple_evaluate(
         model=model,  
         model_args='',  

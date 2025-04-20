@@ -324,7 +324,7 @@ class LolcatsSparsePrefillSlidingWindowAttention(LolcatsLinearAttention):
         return y_true, attn_weights, past_key_value
 
 
-class LinearAttentionSparseSlidingWindowCache(LinearAttentionState):
+class LinearAttentionSparseSlidingWindowCachePrefill(LinearAttentionState):
     """
     Class for `past_key_values`
     -> Alternative to KV cache; here we only maintain a "KV state" and "K state"

@@ -74,7 +74,6 @@ class OurTrainer(DefaultTrainer):
             loss_xent = loss_xent / n_layers * self.xent_factor
             loss_mse = loss_mse / n_layers * self.mse_factor
         loss = loss_xent + loss_mse
-        print('loss xent, mse', loss_xent, loss_mse)
         if 'position_ids' in data:
             outputs = {'loss_xent': loss_xent.item() if self.xent_factor > 0 else 0,
                        'loss_mse': loss_mse.item() if self.mse_factor > 0 else 0,
