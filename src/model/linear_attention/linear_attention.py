@@ -402,6 +402,7 @@ class LinearAttentionState(Cache):
     - Modified from transformers.cache_utils.DynamicCache (v4.36)
     """
     def __init__(self) -> None:
+        super().__init__()
         self._seen_tokens = 0  # should be `self.seen_tokens` in Transformers v4.36
         self._seen_tokens_by_layer: List[int] = []
         self.kv_states: List[torch.Tensor] = []

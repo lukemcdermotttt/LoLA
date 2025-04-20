@@ -23,7 +23,7 @@ from .linear_window_attention_tk_gen import (
 )
 
 from .linear_window_attention_sw_sparse import (
-    LolcatsSparseSlidingWindowAttention
+    LolcatsSparseSlidingWindowAttention, LinearAttentionSparseSlidingWindowCache
 )
 
 from .linear_window_attention_sw_sparse_oracle import (

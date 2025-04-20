@@ -1,601 +1,404 @@
-"""
-Subquadratic attention combining sliding window and linear attentions
-- Using "standard" sliding windows
-- Didactically computes outputs with n^2 attention weights for now
-- Copied + adapted from linear_window_attention_tk.py for single-file reference
+# ---------------------------------------------------------------------------
+# linear_window_attention_sw_sparse.py ― LoLA (window + sparse + linear)
+# Pure‑PyTorch (no Triton) — causal, naturally‑mixed, with shape asserts
+# ---------------------------------------------------------------------------
+import torch, torch.nn as nn, torch.nn.functional as F
+from einops import rearrange
+from typing import Optional, Tuple
+from .linear_attention import LinearAttentionState, LolcatsLinearAttention
 
-For each layer: 
-- We first compute (softmax) attention over sliding windows
-- We then compute standard linear attention to "fill in" the earlier parts
-- We combine to model the entire sequence
-"""
-from typing import List, Tuple, Optional, Callable
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from transformers.cache_utils import Cache
-
-from .linear_attention import (
-    LolcatsLinearAttention, LinearAttentionState, 
-    softmax_attention
-)
+DEBUG_SHAPES = False       # flip to True for verbose shape prints
+EPS          = 1e-6           # numerical stabiliser
+# -------------------------------------------------------------------------
 
 
+def _dbg(tag: str, *tensors):
+    if DEBUG_SHAPES:
+        shapes = ", ".join(str(tuple(t.shape)) for t in tensors)
+        print(f"[DBG] {tag:<16}: {shapes}")
 
 
-
-
-def get_masks(window_size: int, q_len: int, k_len: int, 
-              device: torch.device) -> tuple[torch.Tensor]:
+def _apply_gate(y_nat: torch.Tensor,
+                y_soft: torch.Tensor,
+                gate: torch.Tensor) -> torch.Tensor:
     """
-    Return masks for softmax and linear attention terms
-    -> 1 is include, 0 is ignore
+    y_*   : [B,H,C,D]  or [B,H,1,D]
+    gate  : broadcastable [1,H₀,1,1]   (H can be H₀ or a multiple of it)
     """
-    kwargs = {'device': device, 'dtype': int}
-    causal_mask = torch.ones((q_len, k_len), **kwargs).tril(k_len - q_len)
-    linear_mask = torch.ones((q_len, k_len), **kwargs).tril(k_len - q_len - window_size)
-    window_mask = causal_mask - linear_mask
-    # Return softmax mask (window), linear attention mask
-    # -> shapes broadcast over (b, h, q_len, k_len)
-    return window_mask[None, None, ...], linear_mask[None, None, ...]
+    if gate.size(1) != y_nat.size(1):
+        assert y_nat.size(1) % gate.size(1) == 0, \
+            f"gate heads {gate.size(1)} !| y heads {y_nat.size(1)}"
+        gate = gate.repeat_interleave(y_nat.size(1) // gate.size(1), dim=1)
+    return (1. - gate) * y_nat + gate * y_soft
 
 
-def LoLA_quadratic(q: torch.Tensor, k: torch.Tensor, 
-                               f_q: torch.Tensor, f_k: torch.Tensor,
-                               v: torch.Tensor,
-                               window_factor: torch.Tensor,
-                               linear_factor: torch.Tensor,
-                               window_size: int,
-                               kv_state: torch.Tensor = None,
-                               k_state: torch.Tensor = None,
-                               eps: float = 1e-12,
-                               mask_value: float = -1e8,
-                               global_cache_size: int = 16):
+# ==========================================================================
+# 1.  Per‑layer state  (unchanged except variable‑length FK_top / V_top) ===
+# ==========================================================================
+class LoLAState(nn.Module):
     """
-    Hybrid attention that combines local sparse (sliding window) attention,
-    global sparse attention, and low-rank (linear) attention.
+    LoLA state:
+        sliding window  (K_win / V_win, length C)
+        top-G KV heap   (K_top / V_top, length G)
+        low rank linear attn   (H_sum / S_sum)  for *all remaining* tokens
     """
-    B, H, M, D = q.shape
-    _, _, N, _ = k.shape
-    scale = k.shape[-1] ** -0.5
-
-    # Get the initial masks (assumed to be tensors of shape [B, H, M, N])
-    mask_window, mask_linear = get_masks(window_size, M, N, q.device)
-
-    # Pre-cast inputs to float once.
-    q_f   = q.float()
-    k_f   = k.float()
-    f_q_f = f_q.float()
-    f_k_f = f_k.float()
-
-    # ---------------------------
-    # Sparse mask for global attention
-    # ---------------------------
-    # Compute low-rank attention scores.
-    a_ln = torch.matmul(f_q_f, f_k_f.transpose(-2, -1))  # shape: (B, H, M, N)
-
-    # Compute sliding window (sparse) attention scores.
-    a_sm = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale  # shape: (B, H, M, N)
-    a_sm_masked = a_sm.masked_fill(~mask_window.bool(), mask_value)
-    a_sm_max = a_sm_masked.amax(dim=-1, keepdim=True)
-    a_sm_exp = torch.exp(a_sm - a_sm_max)
-
-    # Compute scores exactly as in the old implementation.
-    # Sum over the query dimension (dim=-2) with keepdim and broadcast by mask_linear.
-    scores = torch.sum(torch.abs(a_ln - a_sm_exp) * mask_window, dim=-2, keepdim=True) * mask_linear
-    # Now scores has shape (B, H, 1, N) broadcasted to (B, H, M, N).
-
-    topk = min(global_cache_size, k.size(-2))  # k.size(-2) == N
-    _, topk_indices = torch.topk(scores, k=topk, dim=-1)
-    # Create a sparse mask of the same shape as scores.
-    mask_sparse = torch.zeros_like(scores, dtype=torch.int, device=q.device)
-    mask_sparse.scatter_(-1, topk_indices, 1)
-    mask_sparse = mask_sparse * mask_linear  # elementwise multiplication
-
-    # Update masks as in the original.
-    mask_window = mask_window + mask_sparse
-    mask_linear = mask_linear - mask_sparse
-
-    # ---------------------------
-    # Compute final attention components using updated masks.
-    # ---------------------------
-    # 1. Sliding window (softmax) attention
-    a_sm = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale
-    a_sm = a_sm.masked_fill(~mask_window.bool(), mask_value)
-    a_sm_max = a_sm.amax(dim=-1, keepdim=True)
-    a_sm = window_factor * torch.exp(a_sm - a_sm_max)
-    sum_sm = a_sm.sum(dim=-1, keepdim=True)
-
-    # 2. Linear (low-rank) attention
-    a_ln = torch.matmul(f_q_f, f_k_f.transpose(-2, -1))
-    a_ln = linear_factor * a_ln.masked_fill(~mask_linear.bool(), 0)
-    sum_ln = a_ln.sum(dim=-1, keepdim=True)
-
-    # 3. Combine to compute attention weights.
-    a = ((a_sm + a_ln) / (sum_sm + sum_ln + eps)).to(q.dtype)
-
-    # Compute output.
-    y = torch.matmul(a_sm + a_ln, v.float())
-    if kv_state is not None:
-        y += linear_factor * torch.matmul(f_q_f, kv_state.float())
-        sum_ln = sum_ln + linear_factor * torch.matmul(f_q_f, k_state.float().unsqueeze(-1))
-    y = (y / (sum_sm + sum_ln + eps)).to(q.dtype)
-    return y, a
+    def __init__(self, C: int, G: int,
+                 dtype: torch.dtype,
+                 device: torch.device | str):
+        super().__init__()
+        self.C, self.G = C, G
+        for name, dt in [
+            ("K_win", dtype), ("V_win", dtype), ("FK_win", dtype), ("win_score", torch.float32),
+            ("K_top", dtype), ("V_top", dtype), ("FK_top", dtype),
+            ("H_sum", torch.float32), ("S_sum", torch.float32),
+            ("heap_score", torch.float32), ("heap_idx", torch.long),
+        ]:
+            self.register_buffer(name, torch.empty(0, device=device, dtype=dt))
+        self.tokens_seen = 0
 
 
+    # -------------------------------------------------------------- public
+    @torch.no_grad()
+    def train_chunk(self,
+                    k_c: torch.Tensor,        # [B,H,C,D]
+                    v_c: torch.Tensor,        # [B,H,C,D]
+                    fk_c: torch.Tensor,       # [B,H,C,F]
+                    score_c: torch.Tensor):   # [B,H,C]
+        """Update sliding window + heap + low‑rank sums with one chunk"""
+        B, H, C, D = k_c.shape
+        _dbg("train_chunk/in", k_c, score_c)
 
-# ----------------------
-# Sliding window helpers
-# ----------------------
-def get_masks(window_size: int, q_len: int, k_len: int, 
-              device: torch.device) -> tuple[torch.Tensor]:
+        # ---- sliding window --------------------------------------------
+        if self.K_win.numel() == 0:
+            self.K_win, self.V_win, self.FK_win, self.win_score = k_c.clone(), v_c.clone(), fk_c.clone(), score_c.clone()
+        else:
+            # ----heap update --------------------------------------------
+            if self.heap_score.numel() == 0:
+                #INIT HEAP
+                if self.G >= C:
+                    #Chunk fits in Heap
+                    self.K_top = self.K_win
+                    self.V_top = self.V_win
+                    self.FK_top = self.FK_win
+                    self.heap_score = self.win_score
+                else:
+                    #Store only top-G of chunk in heap
+                    self.heap_score, top_idx  = self.win_score.topk(self.G, -1,largest=True) # [B,H,G]
+
+                    b = torch.arange(B, device=k_c.device)[:, None, None]
+                    h = torch.arange(H, device=k_c.device)[None, :, None]
+                    self.K_top  = self.K_win[b, h, top_idx]
+                    self.V_top  = self.V_win[b, h, top_idx]
+                    self.FK_top  = self.FK_win[b, h, top_idx]
+
+                    #Store the rest in hidden state
+                    _, bot_idx = self.win_score.topk(C-self.G, -1,largest=False) # [B,H,C-G]
+                    self.H_sum = torch.einsum('b h g f, b h g d -> b h f d',
+                                            self.FK_win[b,h,bot_idx].float(), self.V_win[b,h,bot_idx].float())
+                    self.S_sum = self.FK_win[b,h,bot_idx].float().sum(2) # [B,H,F]
+
+                    assert not (top_idx.unsqueeze(-1) == bot_idx.unsqueeze(-2)).any().item(), "A KV PAIR CANT BE BOTH TOP AND BOTTOM" 
+
+            elif self.heap_score.size(-1)+C <= self.G:
+                #Heap not full
+                self.K_top = torch.cat([self.K_top,self.K_win], 2)
+                self.V_top =  torch.cat([self.V_top,self.V_win], 2)
+                self.FK_top =  torch.cat([self.FK_top,self.FK_win], 2)
+                self.heap_score =  torch.cat([self.heap_score,self.win_score], 2)
+            
+            else:
+                #Compare old heap and chunk leaving sliding window
+                cat_score = torch.cat([self.heap_score, self.win_score], 2)   # [B,H,G+C]
+                cat_K  = torch.cat([self.K_top,self.K_win], 2)
+                cat_V  = torch.cat([self.V_top,self.V_win], 2)
+                cat_FK = torch.cat([self.FK_top,self.FK_win], 2)
+
+                sorted_idx = cat_score.argsort(dim=-1, descending=True)            # [B,H,G + C]
+                top_idx = sorted_idx[..., :self.G]                                 # [B,H,G]
+                bot_idx = sorted_idx[..., self.G:]                                 # [B,H,C]
+                self.heap_score = torch.gather(cat_score, dim=2, index=top_idx)    # [B,H,G]
+                
+                self.K_top = torch.gather(cat_K, dim=2, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,cat_K.size(-1)))
+                self.V_top = torch.gather(cat_V, dim=2, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,cat_V.size(-1)))
+                self.FK_top = torch.gather(cat_FK, dim=2, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,cat_FK.size(-1)))
+
+                #Store the rest in hidden state
+                bot_FK = torch.gather(cat_FK, dim=2, index=bot_idx.unsqueeze(-1).expand(-1,-1,-1,cat_FK.size(-1)))  # [B,H,C,F]
+                bot_V  = torch.gather(cat_V, dim=2, index=bot_idx.unsqueeze(-1).expand(-1,-1,-1,cat_V.size(-1)))   # [B,H,C,D]
+
+                self.H_sum = torch.einsum('b h g f, b h g d -> b h f d',
+                                        bot_FK.float(), bot_V.float())
+                self.S_sum = bot_FK.float().sum(2) # [B,H,F]
+
+
+            self.K_win = k_c
+            self.V_win = v_c
+            self.FK_win = fk_c
+            self.win_score = score_c
+
+        self.tokens_seen += C
+        _dbg("train_chunk/out K_top", self.K_top)
+
+    # ~~~~~~~~~~~~ decode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    @torch.no_grad()
+    def decode_token(self, k_t: torch.Tensor, v_t: torch.Tensor, fk_t: torch.Tensor):
+        """Append a single KV ( [B,H,D] / [B,H,F] ) during generation"""
+        
+        #NOTE: WE ARE NOT USING CACHING IN DECODING STEP YET.
+        if self.K_win.numel() == 0:
+            self.K_win, self.V_win, self.FK_win = k_t.unsqueeze(2), v_t.unsqueeze(2), fk_t.unsqueeze(2)
+        else:
+            #Store the pair leaving the window in the Hidden State
+            self.H_sum += torch.einsum('b h f, b h d -> b h f d',
+                                   self.FK_win[:,:,:1].float(), self.V_win[:,:,:1].float())
+            self.S_sum +=  self.FK_win[:,:,:1].float()
+            
+            #Slide the window
+            self.K_win = torch.cat([self.K_win[:, :, 1:], k_t.unsqueeze(2)], 2)
+            self.V_win = torch.cat([self.V_win[:, :, 1:], v_t.unsqueeze(2)], 2)
+            self.FK_win = torch.cat([self.FK_win[:, :, 1:], fk_t.unsqueeze(2)], 2)
+
+       
+        self.tokens_seen += 1
+
+
+# ==========================================================================
+# 2.  Core: soft‑max on (window ∪ heap)  +  linear on “others” ============
+# ==========================================================================
+def _softmax_window_plus_heap(q, Kw, Vw, Kh, Vh):
     """
-    Return masks for softmax and linear attention terms
-    -> 1 is include, 0 is ignore
+    Soft‑max over concatenation of
+        – window keys (Kw,Vw)   length ≤ 2C
+        – heap   keys (Kh,Vh)   length = G
+    Shapes: q [B,H,C,D]   Kw/Vw [B,H,S,D]   Kh/Vh [B,H,G,D]
+    Returns (y_soft, Z_soft) with y_soft in [B,H,C,D]  (unnormed numerator),
+                              Z_soft  in [B,H,C,1]
     """
-    kwargs = {'device': device, 'dtype': int}
-    causal_mask = torch.ones((q_len, k_len), **kwargs).tril(k_len - q_len)
-    linear_mask = torch.ones((q_len, k_len), **kwargs).tril(k_len - q_len - window_size)
-    window_mask = causal_mask - linear_mask
-    # Return softmax mask (window), linear attention mask
-    # -> shapes broadcast over (b, h, q_len, k_len)
-    return window_mask[None, None, ...], linear_mask[None, None, ...]
+    if Kh.numel() == 0:
+        K_all, V_all = Kw, Vw
+    else:
+        K_all = torch.cat([Kw, Kh], 2)
+        V_all = torch.cat([Vw, Vh], 2)
+
+    scale  = K_all.size(-1) ** -0.5
+    logits = torch.einsum('b h q d, b h k d -> b h q k',
+                          q.float(), K_all.float()) * scale
+
+    S = Kw.size(2)
+    G = 0 if Kh.numel() == 0 else Kh.size(2)
+    C = q.size(2)
+    len_prev = S - C                     # keys from previous chunk
+    causal = torch.ones((q.size(2), K_all.size(2)), device=q.device).tril(len_prev).bool()[None,None,:]
+    logits = logits.masked_fill(~causal, -1e9)
+
+    #exp_l   = logits.exp()                          # [B,H,C,S+G]
+    exp_l = torch.exp(logits - logits.amax(dim=-1, keepdim=True)) #NOTE: We should be using this.
+    Z_soft  = exp_l.sum(-1, keepdim=True)
+    y_soft  = torch.einsum('... q k, ... k d -> ... q d', exp_l, V_all.float())
+    return y_soft, Z_soft
 
 
-def hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor, 
-                               f_q: torch.Tensor, f_k: torch.Tensor,
-                               v: torch.Tensor,
-                               window_factor: torch.Tensor,
-                               linear_factor: torch.Tensor,
-                               window_size: int,
-                               kv_state: torch.Tensor = None,
-                               k_state: torch.Tensor = None,
-                               eps: float = 1e-12,
-                               mask_value: float = -1e8,
-                               global_cache_size: int = 16):
-    
+def _linear_other(q_f,       # [B,H,C,F]
+                  fk_sum,    # [B,H,F,D]
+                  s_sum):     # [B,H,F]
+                        
     """
-    Hybrid attention that combines local sparse (sliding window) attention,
-    global sparse attention, and low-rank (linear) attention.
-    
-    This version is refactored for memory efficiency using torch.matmul in place of einsum,
-    while replicating the behavior of the original implementation exactly.
+    Low‑rank path on *all* tokens that live outside window ∪ heap.
     """
-    B, H, M, D = q.shape
-    _, _, N, _ = k.shape
-    scale = k.shape[-1] ** -0.5
-
-    # Get the initial masks (assumed to be tensors of shape [B, H, M, N])
-    mask_window, mask_linear = get_masks(window_size, M, N, q.device)
-
-    # Pre-cast inputs to float once.
-    q_f   = q.float()
-    k_f   = k.float()
-    f_q_f = f_q.float()
-    f_k_f = f_k.float()
-
-    # ---------------------------
-    # Sparse mask for global attention
-    # ---------------------------
-    # Compute low-rank attention scores.
-    a_ln = torch.matmul(f_q_f, f_k_f.transpose(-2, -1))  # shape: (B, H, M, N)
-
-    # Compute sliding window (sparse) attention scores.
-    a_sm = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale  # shape: (B, H, M, N)
-    a_sm_masked = a_sm.masked_fill(~mask_window.bool(), mask_value)
-    a_sm_max = a_sm_masked.amax(dim=-1, keepdim=True)
-    a_sm_exp = torch.exp(a_sm - a_sm_max)
-
-    # Compute scores exactly as in the old implementation.
-    # Sum over the query dimension (dim=-2) with keepdim and broadcast by mask_linear.
-
-    #w_mask = mask_window * torch.ones((M, N), device=q.device).tril(M-N-window_size)[None, None, ...] #this should be like no sliding window.
-    #w_mask instead of mask_window
-    scores = torch.sum(torch.abs(a_ln - a_sm_exp) * mask_window, dim=-2, keepdim=True) * mask_linear
-    # Now scores has shape (B, H, 1, N) broadcasted to (B, H, M, N).
-
-    topk = min(global_cache_size, k.size(-2))  # k.size(-2) == N
-    _, topk_indices = torch.topk(scores, k=topk, dim=-1)
-    # Create a sparse mask of the same shape as scores.
-    mask_sparse = torch.zeros_like(scores, dtype=torch.int, device=q.device)
-    mask_sparse.scatter_(-1, topk_indices, 1)
-    mask_sparse = mask_sparse * mask_linear  # elementwise multiplication
-
-    # Update masks as in the original.
-    mask_window = mask_window + mask_sparse
-    mask_linear = mask_linear - mask_sparse
-
-    # ---------------------------
-    # Compute final attention components using updated masks.
-    # ---------------------------
-    # 1. Sliding window (softmax) attention
-    a_sm = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale
-    a_sm = a_sm.masked_fill(~mask_window.bool(), mask_value)
-    a_sm_max = a_sm.amax(dim=-1, keepdim=True)
-    a_sm = window_factor * torch.exp(a_sm - a_sm_max)
-    sum_sm = a_sm.sum(dim=-1, keepdim=True)
-
-    # 2. Linear (low-rank) attention
-    a_ln = torch.matmul(f_q_f, f_k_f.transpose(-2, -1))
-    a_ln = linear_factor * a_ln.masked_fill(~mask_linear.bool(), 0)
-    sum_ln = a_ln.sum(dim=-1, keepdim=True)
-
-    # 3. Combine to compute attention weights.
-    a = ((a_sm + a_ln) / (sum_sm + sum_ln + eps)).to(q.dtype)
-
-    # Compute output.
-    y = torch.matmul(a_sm + a_ln, v.float())
-    if kv_state is not None:
-        y += linear_factor * torch.matmul(f_q_f, kv_state.float())
-        sum_ln = sum_ln + linear_factor * torch.matmul(f_q_f, k_state.float().unsqueeze(-1))
-    y = (y / (sum_sm + sum_ln + eps)).to(q.dtype)
-    return y, a
+    if fk_sum.numel() == 0:
+        return 0, 0
+    y_lin = torch.einsum('b h c f, b h f d -> b h c d', q_f.float(), fk_sum)
+    Z_lin = torch.einsum('b h c f, b h f -> b h c',    q_f.float(), s_sum).unsqueeze(-1)
+    return y_lin, Z_lin
 
 
-
-
-def somewhat_old_hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor, 
-                               f_q: torch.Tensor, f_k: torch.Tensor,
-                               v: torch.Tensor,
-                               window_factor: torch.Tensor,
-                               linear_factor: torch.Tensor,
-                               window_size: int,
-                               kv_state: torch.Tensor = None,
-                               k_state: torch.Tensor = None,
-                               eps: float = 1e-12,
-                               mask_value: float=-1e8,
-                               global_cache_size: int=16):
-    
-    #Hybrid attention combining local sparse attention (sliding window), global sparse attention, and low rank attention (linear attention)
-
-    #Hack to get the right mask.
-    mask_window, mask_linear = get_masks(window_size, q.shape[-2], k.shape[-2], q.device)
-    
-    a_ln = torch.einsum('bhmd,bhnd->bhmn', f_q.float(), f_k.float())
-    a_sm = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * (k.shape[-1] ** -0.5)
-    a_sm_max = torch.amax(a_sm.masked_fill(~mask_window.bool(), mask_value), dim=-1, keepdim=True) #max in sliding window only.
-    a_sm = torch.exp(a_sm - a_sm_max)
-
-    scores = torch.sum(torch.abs(a_ln - a_sm)*mask_window, dim=-2, keepdims=True).expand(a_sm.size()) * mask_linear
-
-    topk_vals, topk_indices = torch.topk(scores, k=min(global_cache_size,k.size(-2)), dim=-1)
-    mask_sparse = torch.zeros_like(scores, dtype=torch.int, device=q.device).scatter_(-1, topk_indices, 1) * mask_linear
-    mask_window = mask_window + mask_sparse
-    mask_linear = mask_linear - mask_sparse
-    
-
-    #NOTE: Stich correct implementation below
-    #mask_window, mask_linear = get_masks(window_size, q.shape[-2], k.shape[-2], q.device)
-
-    # 1. Sliding window (softmax attention)
-    a_sm = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * (k.shape[-1] ** -0.5)
-    a_sm = a_sm.masked_fill(~mask_window.bool(), mask_value)
-    # torch.softmax(a_sm, dim=-1), but we account for the max when combining
-    a_sm_max = torch.amax(a_sm, dim=-1, keepdim=True)
-    a_sm   = window_factor * torch.exp(a_sm - a_sm_max)
-    sum_sm = a_sm.sum(dim=-1, keepdim=True)
-
-    # 2. Under window (linear attention)
-    a_ln = torch.einsum('bhmd,bhnd->bhmn', f_q.float(), f_k.float())
-    a_ln = linear_factor * a_ln.masked_fill(~mask_linear.bool(), 0)
-    sum_ln = a_ln.sum(dim=-1, keepdim=True)
-
-    # 3. Combine
-    a = ((a_sm + a_ln) / (sum_sm + sum_ln)).to(q.dtype)  # Save attention weights
-    # Allow outputs to also depend on prior kv_state and k_state
-    y = torch.einsum('bhmn,bhnd->bhmd', a_sm + a_ln, v.float())
-    if kv_state is not None:  # Combine with prior kv_state and k_state
-        y += linear_factor * torch.einsum('bhld,bhdf->bhlf', f_q.float(), kv_state.float())
-        sum_ln += linear_factor * torch.einsum(
-            'bhld,bhnd->bhl', f_q.float(), k_state.float())[..., None]
-    y = (y / (sum_sm + sum_ln)).to(q.dtype)
-    return y, a  # attention weights only for the last chunk
-
-
-def old_hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor, 
-                               f_q: torch.Tensor, f_k: torch.Tensor,
-                               v: torch.Tensor,
-                               window_factor: torch.Tensor,
-                               linear_factor: torch.Tensor,
-                               window_size: int,
-                               kv_state: torch.Tensor = None,
-                               k_state: torch.Tensor = None,
-                               eps: float = 1e-12,
-                               mask_value: float=-1e8):
+# ==========================================================================
+# 3.  Chunked forward ======================================================
+# ==========================================================================
+def _lola_forward(
+        q, k, v, fq, fk, *,
+        C: int,
+        state: LoLAState,
+        gate: torch.Tensor) -> Tuple[torch.Tensor, LoLAState]:
     """
-    Hybrid attention combining sliding window and linear attentions
+    All tensors come in as [B,H,L,D] (or [B,H,L,F] for fq/fk).
     """
 
-    mask_window, mask_linear = get_masks(window_size, q.shape[-2], k.shape[-2], q.device)
+    #Pad the sequences, so it can be chunked.
+    B, H, L, D = q.shape
+    pad = (C - L % C) % C
+    if pad:
+        pad_qd = torch.zeros(B, H, pad, D,         dtype=q.dtype,  device=q.device)
+        pad_f  = torch.zeros(B, H, pad, fq.size(-1), dtype=fq.dtype, device=q.device)
+        q, k, v = [torch.cat([t, pad_qd], 2) for t in (q, k, v)]
+        fq, fk  = [torch.cat([t, pad_f ], 2) for t in (fq, fk)]
+        L += pad
+    N = L // C
 
-    # 1. Sliding window (softmax attention)
-    a_sm = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * (k.shape[-1] ** -0.5)
-    a_sm = a_sm.masked_fill(~mask_window.bool(), mask_value)
-    # torch.softmax(a_sm, dim=-1), but we account for the max when combining
-    a_sm_max = torch.amax(a_sm, dim=-1, keepdim=True)
-    a_sm   = window_factor * torch.exp(a_sm - a_sm_max)
-    sum_sm = a_sm.sum(dim=-1, keepdim=True)
+    # chunk views ----------------------------------------------------------
+    q_c, k_c, v_c = (rearrange(t, 'b h (n c) d -> n b h c d', c=C)
+                     for t in (q, k, v))
+    fq_c, fk_c =   (rearrange(t, 'b h (n c) f -> n b h c f', c=C)
+                     for t in (fq, fk))
 
-    # 2. Under window (linear attention)
-    a_ln = torch.einsum('bhmd,bhnd->bhmn', f_q.float(), f_k.float())
-    a_ln = linear_factor * a_ln.masked_fill(~mask_linear.bool(), 0)
-    sum_ln = a_ln.sum(dim=-1, keepdim=True)
+    out = torch.empty_like(q)
+    for n in range(N):
+        qn, kn, vn  = q_c[n], k_c[n], v_c[n]
+        fq_n, fk_n  = fq_c[n], fk_c[n]
 
-    # 3. Combine
-    a = ((a_sm + a_ln) / (sum_sm + sum_ln)).to(q.dtype)  # Save attention weights
-    # Allow outputs to also depend on prior kv_state and k_state
-    y = torch.einsum('bhmn,bhnd->bhmd', a_sm + a_ln, v.float())
-    if kv_state is not None:  # Combine with prior kv_state and k_state
-        y += linear_factor * torch.einsum('bhld,bhdf->bhlf', f_q.float(), kv_state.float())
-        sum_ln += linear_factor * torch.einsum(
-            'bhld,bhnd->bhl', f_q.float(), k_state.float())[..., None]
-    y = (y / (sum_sm + sum_ln)).to(q.dtype)
-    return y, a  # attention weights only for the last chunk
+        prev_k, prev_v = (k_c[n-1], v_c[n-1]) if n else (kn[:, :, :0], vn[:, :, :0])
+        prev_fk        = fk_c[n-1]           if n else fk_n[:, :, :0]
+
+        # ---- soft‑max over window ∪ heap --------------------------------
+        Kw = torch.cat([prev_k, kn], 2)
+        Vw = torch.cat([prev_v, vn], 2)
+        y_soft_num, Z_soft = _softmax_window_plus_heap(
+            qn, Kw, Vw, state.K_top, state.V_top)
+
+        # ---- linear on "others" -----------------------------------------
+        #   cumulative sums in state already exclude window & heap keys
+        y_lin_num, Z_lin = _linear_other(fq_n, state.H_sum, state.S_sum)
+
+        # ---- natural mixture & gate -------------------------------------
+        #y_nat = (y_soft_num + y_lin_num) / (Z_soft + Z_lin + EPS)
+        #y     = _apply_gate(y_nat, y_soft_num / (Z_soft + EPS), gate)
+        """
+        if isinstance(y_lin_num,torch.Tensor):
+            print('gate value across 5 heads', gate[0,:5,0,0])
+            print('normalized ysoft', (y_soft_num / (Z_soft + EPS))[0,0,:5,0])
+            print('normalized ylin', (y_lin_num / (Z_lin + EPS))[0,0,:5,0])
+            print('ysoft_num', (y_soft_num)[0,0,:5,0])
+            print('ylin_num', (y_lin_num)[0,0,:5,0])
+            print('gated_num', (y_soft_num*gate + y_lin_num*(1-gate))[0,0,:5,0])
+            print('Z_soft across 5 tokens', Z_soft[0,0,:5])
+            print('Z_lin across 5 tokens', Z_lin[0,0,:5])
+        """
+        if isinstance(y_lin_num,torch.Tensor):
+            y = (y_soft_num*(1-gate) + y_lin_num*(gate)) / (Z_soft*(1-gate) + Z_lin*(gate) + EPS) 
+            #y = (y_soft_num*gate + y_lin_num*(1-gate)) / (Z_soft*gate + Z_lin*(1-gate) + EPS) #NOTE: IDEAL GATING, BUT THE ONE ABOVE GETS 48%. THIS GETS 0%.
+        else:
+            y = y_soft_num*(1-gate) / (Z_soft*(1-gate) + EPS)
+
+        out[:, :, n*C:(n+1)*C] = y
+
+        # ---- residual score (error if we linearise the *window*) --------
+        lin_win_num, lin_win_den = _linear_other(fq_n,
+                                                 torch.einsum('b h k f, b h k d -> b h f d',
+                                                              torch.cat([prev_fk, fk_n], 2).float(),
+                                                              Vw.float()),
+                                                 torch.cat([prev_fk, fk_n], 2).float().sum(2))
+        y_lin_win = lin_win_num / (lin_win_den + EPS)
+        resid     = (y_soft_num / (Z_soft + EPS) - y_lin_win).detach().mean(2)
+        score_c   = torch.einsum('b h d, b h c d -> b h c', resid.float(), vn.float()).abs()
+
+        state.train_chunk(kn, vn, fk_n, score_c)
+
+    return out[:, :, :L-pad], state 
 
 
-# ---------------------
-# Attention layer class
-# ---------------------
+# ==========================================================================
+# 4.  Decode (one token) ===================================================
+# ==========================================================================
+
+#NOTE: WE ARE NOT USING SPARSE CACHING FOR DECODING YET.
+@torch.no_grad()
+def _lola_decode(
+        q, k, v, fq, fk, *,
+        C: int,
+        state: LoLAState,
+        gate: torch.Tensor):
+    print('DECODING: ERORR NOT SUPPORTED I THINK')
+    if state.tokens_seen == 0:                         # bootstrap
+        state.decode_token(k.squeeze(2), v.squeeze(2), fk.squeeze(2))
+        return v, state
+
+    y_soft_num, Z_soft = _softmax_window_plus_heap(
+        q, state.K_win, state.V_win,
+        state.K_top, state.V_top)
+
+    y_lin_num, Z_lin = _linear_other(fq, state.H_sum, state.S_sum)
+    y_nat  = (y_soft_num + y_lin_num) / (Z_soft + Z_lin + EPS)
+    y_out  = _apply_gate(y_nat, y_soft_num / (Z_soft + EPS), gate)
+
+    state.decode_token(k.squeeze(2), v.squeeze(2), fk.squeeze(2))
+    return y_out, state
+
+
+# ==========================================================================
+# 5.  Public wrapper (permutes once) =======================================
+# ==========================================================================
+def lola_sparse_compatible(
+    q, k, fq, fk, v,
+    window_factor, linear_factor,      # linear_factor kept for API parity
+    *, window_size: int,
+    global_cache_size: int,
+    kv_state: Optional['LinearAttentionSparseSlidingWindowCache'] = None,
+    **_,
+):
+    C = window_size
+    state = kv_state.state if kv_state else LoLAState(C, global_cache_size, q.dtype, q.device)
+    gate  = window_factor.to(dtype=q.dtype)            # [1,H₀,1,1]
+
+    # external [B,L,H,D] → internal [B,H,L,D]
+    qh, kh, vh, fqh, fkh = (t for t in (q, k, v, fq, fk)) # was t.permute(0, 2, 1, 3)
+    _dbg("wrapper/in", qh, gate)
+
+    if q.size(1) > 1:                          # pre‑fill / training
+        y_h, state = _lola_forward(qh, kh, vh, fqh, fkh,
+                                   C=C, state=state, gate=gate)
+    else:                                      # generation
+        y_h, state = _lola_decode(qh, kh, vh, fqh, fkh,
+                                  C=C, state=state, gate=gate)
+
+    y = y_h.permute(0, 2, 1, 3)                # back to [B,L,H,D]
+
+    if kv_state is None:
+        kv_state = LinearAttentionSparseSlidingWindowCache(
+            window_size=C, global_cache_size=global_cache_size,
+            dtype=q.dtype, device=q.device)
+    kv_state.state = state
+    return y, None, kv_state
+
+
+# ==========================================================================
+# 6.  HF module wrapper ====================================================
+# ==========================================================================
 class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
-    """
-    Lolcats attention combining sliding window and linear attention
-    """
-    def __init__(self, 
-                 window_size: int = 64, 
-                 decode_window_size: int = None,
-                 affine_attention_factors: bool = False,
-                 init_window_factor: float = 0,
-                 train_window_factor: bool = True,
-                 state_grad_enabled: bool = False,
-                 global_cache_size: int = 16,
-                 **kwargs):
+    def __init__(self, *, window_size=64, global_cache_size=128,
+                 init_window_factor=0.0, train_window_factor=True, **kw):
+        super().__init__(**kw)
         self.window_size = window_size
         self.global_cache_size = global_cache_size
-        self.decode_window_size = (
-            decode_window_size if decode_window_size is not None else window_size
-        )
-        self.window_kwargs = {'dimension': 2, 'size': window_size, 'step': 1}
-        super().__init__(**kwargs)
-        self.attention_type = kwargs['attention_type']  #  'hedgehog_llama_window_sw'
-        # Determine how we compute attentions
-        self.quadratic_attention = hybrid_attention_quadratic
-        self.attention_type = kwargs['attention_type']  # 'hedgehog_long_llama_window_sw'
-        # Learnable factor for combining attentions
-        self.affine_attention_factors = affine_attention_factors
-        device, dtype = self.q_proj.weight.device, self.q_proj.weight.dtype
+        gate_init = init_window_factor * torch.ones(
+            1, self.num_heads, 1, 1,
+            dtype=self.q_proj.weight.dtype, device=self.q_proj.weight.device)
         if train_window_factor:
-            self.window_factors = nn.Parameter(
-                init_window_factor * torch.ones(1, self.num_heads, 1, 1, device=device, dtype=dtype))
+            self.window_factors = nn.Parameter(gate_init)
         else:
-            self.register_buffer(
-                "window_factors", init_window_factor * torch.ones(1, self.num_heads, 1, 1, device=device, dtype=dtype)
-            )
-        # Whether we use original flash attention 2 inference (use during attention transfer)
-        self.base_inference = False
-        self.state_grad_enabled = state_grad_enabled
-        
-    def forward(self,
-                hidden_states: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None,
-                position_ids: Optional[torch.LongTensor] = None,
-                past_key_value: Optional[Cache] = None,
-                output_attentions: bool = False,
-                use_cache: bool = False,
-                **kwargs,
-               ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        """
-        Forward pass with the option to compute attention weights multiple ways
-        if self.train_attention is True
-        -> Consistent with HuggingFace Transformers for easy use with their pretrained models
-        """
-        b, l, _ = hidden_states.size()
-        q, k, v, kv_seq_len = self.process_qkv(hidden_states, attention_mask, 
-                                               position_ids, past_key_value)
-        f_q, f_k = self.feature_map_q(q), self.feature_map_k(k)  # Have to do after repeat for grouped-query attn if we use same fmap
+            self.register_buffer('window_factors', gate_init)
+        self.quadratic_attention = lola_sparse_compatible
 
-        if self.train_attention:
-            # 1. Compute "ground-truth" attention output and weights
-            with torch.no_grad():
-                _y_true, a_true = softmax_attention(q, k, v)[:2]
-                y_true = _y_true.transpose(1, 2).contiguous().view(b, l, self.hidden_size)
-                y_true = self.o_proj(y_true)
-
-            # 2. Compute "predicted" attention outputs
-            # compute attn weights under sliding window
-            window_factors = F.sigmoid(self.window_factors)
-            linear_factors = 1 - window_factors if self.affine_attention_factors else 1
-            y_pred, a_pred = self.quadratic_attention(q, k, f_q, f_k, v,
-                                                      window_factors, linear_factors,
-                                                      window_size=self.window_size,
-                                                      global_cache_size=self.global_cache_size)
-            attn_weights = ((a_pred, a_true), (y_pred, _y_true))
-        else:
-            attn_weights = None
-            # attention_mask = None  # For now this is always True
-            if past_key_value is None:  # Regular training
-                window_factors = F.sigmoid(self.window_factors)
-                linear_factors = 1 - window_factors if self.affine_attention_factors else 1
-                y_true, a_pred = self.quadratic_attention(q, k, f_q, f_k, v,
-                                                          window_factors, linear_factors,
-                                                          window_size=self.window_size,
-                                                      global_cache_size=self.global_cache_size)
-                attn_weights = a_pred
-            else:
-                past_key_value.window_size = self.decode_window_size
-                if f_q.shape[2] == 1 and kv_seq_len > 1 and not self.training:  # Generating
-                    print('GENERATING: LOLA NOT SUPPORTED HERE (on this branch)!')
-                    assert use_cache is True
-                    _kv = past_key_value.update_for_decoding(k, v, self.layer_idx,
-                                                             self.feature_map_k,
-                                                             dtype=q.dtype)
-                    k_cache, v_cache, f_kv_state, f_k_state = _kv
-
-                    # Sliding window + linear attention decode
-                    window_factors = F.sigmoid(self.window_factors)
-                    linear_factors = 1 - window_factors if self.affine_attention_factors else 1
-
-                    # Softmax attention terms
-                    a_sm = torch.einsum('bhmd,bhnd->bhmn', q.float(), k_cache.float()) * (k.shape[-1] ** -0.5)
-                    a_sm_max = torch.amax(a_sm, dim=-1, keepdim=True)
-                    a_sm   = window_factors * torch.exp(a_sm - a_sm_max)
-                    sum_sm = a_sm.sum(dim=-1, keepdim=True)
-
-                    # Combine with linear attention terms
-                    y_true = (torch.einsum('bhmn,bhnd->bhmd', a_sm, v_cache.float())
-                              + linear_factors * torch.einsum('bhlf,bhfd->bhld', f_q.float(), f_kv_state.float()))
-                    sum_ln = linear_factors * torch.einsum(
-                        'bhlf,bhnf->bhl', f_q.float(), f_k_state.float())[..., None]
-                    y_true = (y_true / (sum_sm + sum_ln)).to(q.dtype) 
-
-                else:  # Stateful training
-                    try:
-                        kv_state = past_key_value.kv_states[self.layer_idx]
-                        k_state  = past_key_value.k_states[self.layer_idx]
-                        print('USING LAST K AND KV STATE IN STATEFUL TRAINING: LOLA NOT SUPPORTED HERE!')
-                    except IndexError:
-                        kv_state, k_state = None, None
-                    window_factors = F.sigmoid(self.window_factors)
-                    linear_factors = 1 - window_factors if self.affine_attention_factors else 1
-                    y_true, _ = self.quadratic_attention(q, k, f_q, f_k, v,
-                                                         window_factors, linear_factors,
-                                                         window_size=self.window_size,
-                                                         kv_state=kv_state,
-                                                         k_state=k_state,
-                                                         global_cache_size=self.global_cache_size)
-                    
-                    # Save and update KV cache and states
-                    # past_key_value.update(k, v.detach(), self.layer_idx,
-                    #                       fmap_key_states=f_k.detach(),
-                    #                       accumulate_in_fp32=True)
-                    past_key_value.update(k, v, self.layer_idx,
-                                          fmap_key_states=f_k,
-                                          accumulate_in_fp32=True)
-            # Concatenate heads and apply output projection
-            y_true = y_true.transpose(1, 2).contiguous().view(b, l, self.hidden_size)
-            y_true = self.o_proj(y_true)
-        return y_true, attn_weights, past_key_value
+    def forward(self, hidden_states, attention_mask=None,
+                position_ids=None, past_key_value=None,
+                use_cache=False, **kw):
+        q, k, v, _ = self.process_qkv(hidden_states, attention_mask,
+                                      position_ids, past_key_value)
+        f_q, f_k = self.feature_map_q(q), self.feature_map_k(k)
+        y, _, new_state = self.quadratic_attention(
+            q, k, f_q, f_k, v,
+            torch.sigmoid(self.window_factors), 1.0,
+            window_size=self.window_size,
+            global_cache_size=self.global_cache_size,
+            kv_state=past_key_value)
+        y = rearrange(y, 'b l h d -> b l (h d)')
+        return self.o_proj(y), None, (new_state if use_cache else None)
 
 
-class LinearAttentionSlidingWindowCache(LinearAttentionState):
-    """
-    Class for `past_key_values`
-    -> Alternative to KV cache; here we only maintain a "KV state" and "K state"
-    -> Modified from transformers.cache_utils.DynamicCache (v4.36)
-    """
-    def __init__(self, window_size: int = 64) -> None:
+# ==========================================================================
+class LinearAttentionSparseSlidingWindowCache(LinearAttentionState):
+    def __init__(self, *, window_size=64, global_cache_size=128,
+                 dtype=torch.bfloat16, device='cuda'):
         super().__init__()
-        self._seen_tokens = 0  # should be `self.seen_tokens` in Transformers v4.36
-        self._seen_tokens_by_layer: List[int] = []
-        self.kv_states: List[torch.Tensor] = []
-        self.k_states:  List[torch.Tensor] = []
-
-        # Account for sliding windows
-        self.decode_kv_states: List[torch.Tensor] = []
-        self.decode_k_states: List[torch.Tensor] = []
-        self.k_cache: List[torch.Tensor] = []
-        self.v_cache: List[torch.Tensor] = []
-        self.window_size = window_size
-
-    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, 
-               layer_idx: Optional[int] = None, cache_kwargs: Optional[any] = None,
-               accumulate_in_fp32: bool = False, 
-               fmap_key_states: torch.Tensor = None,  # should not be None
-               grad_enabled: bool = False,
-               **kwargs: any,
-              ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Update KV, K states; and KV cache during training
-        - For decoding, use `self.decode_kv_states` to keep track of KV states 
-          up to sliding window terms
-        - For (chunked) training, use `self.kv_states` to keep track of KV states
-          up to end of sequence
-        - Likewise for `self.decode_k_states` and `self.k_states`
-        """
-        with torch.set_grad_enabled(grad_enabled):
-            if layer_idx == 0:
-                self._seen_tokens += key_states.shape[-2]
-
-            dtype = key_states.dtype
-            if accumulate_in_fp32:
-                # key_states = key_states.float()
-                fmap_key_states = fmap_key_states.float()
-                value_states = value_states.float()
-
-            # Decoding KV state (KV terms up to last window_size)
-            decode_kv_state = torch.einsum(
-                'bhlf,bhld->bhfd', fmap_key_states[:, :, :-self.window_size], value_states[:, :, :-self.window_size]
-            )
-            # KV state
-            kv_state = decode_kv_state + torch.einsum(
-                'bhlf,bhld->bhfd', fmap_key_states[:, :, -self.window_size:], value_states[:, :, -self.window_size:]
-            )
-            # shape is b, h, 1, f; note the 1
-            decode_k_state = fmap_key_states[:, :, :-self.window_size].sum(dim=-2, keepdim=True)
-            k_state = (decode_k_state + fmap_key_states[:, :, -self.window_size:].sum(dim=-2, keepdim=True))
-
-            # Update the cache
-            if len(self.k_states) <= layer_idx:  # Initializing kv and k states
-                self.kv_states.append(kv_state.to(dtype))
-                self.k_states.append(k_state.to(dtype))
-
-                self.decode_kv_states.append(decode_kv_state.to(dtype))
-                self.decode_k_states.append(decode_k_state.to(dtype))
-
-                self.k_cache.append(key_states[:, :, -self.window_size:, :])
-                self.v_cache.append(value_states[:, :, -self.window_size:, :].to(dtype))
-                # self._seen_tokens_by_layer[layer_idx].append(key_states.shape[-2])
-            else:
-                # Update kv and k states recurrently
-                kv_state = (self.kv_states[layer_idx].to(kv_state.dtype) + kv_state).to(dtype)
-                k_state  = (self.k_states[layer_idx].to(kv_state.dtype) + k_state).to(dtype)
-                self.kv_states[layer_idx] = kv_state
-                self.k_states[layer_idx]  = k_state
-
-                decode_kv_state = (self.decode_kv_states[layer_idx].to(kv_state.dtype) 
-                                   + decode_kv_state).to(dtype)
-                decode_k_state  = (self.decode_k_states[layer_idx].to(kv_state.dtype) 
-                                   + decode_k_state).to(dtype)
-                self.decode_kv_states[layer_idx] = decode_kv_state
-                self.decode_k_states[layer_idx]  = decode_k_state
-
-                self.k_cache[layer_idx] = key_states[:, :, -self.window_size:, :]
-                self.v_cache[layer_idx] = value_states[:, :, -self.window_size:, :]
-            self._seen_tokens_by_layer[layer_idx] += key_states.shape[-2]
-
-        return self.kv_states[layer_idx], self.k_states[layer_idx]
-
-    def update_for_decoding(self, keys: torch.Tensor, values: torch.Tensor, 
-                            layer_idx: int, feature_map_k: Callable, dtype: torch.dtype):
-        """
-        Update the decoding KV and K states, and KV cache, during decodeing
-        """
-        with torch.no_grad():
-            k_cache = self.k_cache[layer_idx]
-            v_cache = self.v_cache[layer_idx]
-
-            if k_cache.shape[-2] < self.window_size:  # build window-size cache
-                self.k_cache[layer_idx] = torch.cat([k_cache, keys], dim=-2)
-                self.v_cache[layer_idx] = torch.cat([v_cache, values], dim=-2)
-            else:
-                # MZ 6/3: handle short inputs; zero-out padding when initial k.shape[2] < self.window_size
-                # if k_cache[:, :, :1, :].sum() == 0:   # heuristic for zeroing out padding in cache
-                #     f_k_state = torch.zeros(k_cache[:, :, :1, :].shape, dtype=dtype, device=k_cache.device)
-                # else:
-                #     f_k_state = feature_map_k(k_cache[:, :, :1, :])
-                # -> MZ (later): above only relevant if we zero-pad in our hybrid attention computation
-                k_state = feature_map_k(k_cache[:, :, :1, :])
-                v_state = v_cache[:, :, :1, :]
-                kv_state = torch.einsum('bhlf,bhld->bhfd', k_state.float(), v_state.float()).to(dtype) # b, h, f, d
-                self.decode_kv_states[layer_idx] += kv_state
-                self.decode_k_states[layer_idx] += k_state
-                
-                self.k_cache[layer_idx] = torch.cat([k_cache[:, :, 1:, :], keys], dim=-2)
-                self.v_cache[layer_idx] = torch.cat([v_cache[:, :, 1:, :], values], dim=-2)
-            
-            if layer_idx == 0:
-                self._seen_tokens += keys.shape[-2]
-            self._seen_tokens_by_layer[layer_idx] += keys.shape[-2]
-            return (self.k_cache[layer_idx], self.v_cache[layer_idx], 
-                    self.decode_kv_states[layer_idx], self.decode_k_states[layer_idx])
+        self.state = LoLAState(window_size, global_cache_size, dtype, device)
+        self.kv_states.append(self.state.H_sum)
+        self.k_states.append(self.state.S_sum)

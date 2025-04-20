@@ -176,9 +176,13 @@ def get_attention_cache(attention_type: str, past_key_values: any = None):
         from .linear_attention import LinearAttentionTKWindowCache
         return LinearAttentionTKWindowCache()
     
-    elif 'llama_window_sw_sparse' in attention_type:
+    elif 'prefill' in attention_type:
         from .linear_attention import LinearAttentionSparsePrefillSlidingWindowCache
         return LinearAttentionSparsePrefillSlidingWindowCache()
+    
+    elif 'llama_window_sw_sparse' in attention_type:
+        from .linear_attention import LinearAttentionSparseSlidingWindowCache
+        return LinearAttentionSparseSlidingWindowCache()
 
     elif 'llama_window_sw' in attention_type:
         from .linear_attention import LinearAttentionSlidingWindowCache
