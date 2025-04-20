@@ -13,7 +13,7 @@ model_config_path="configs/model/inference_llama3_2_1b_prefill.yaml" #"configs/m
 python eval_lm_harness.py \
 --model_type lolcats_ckpt \
 --attn_mlp_checkpoint_path $distill_checkpoint \
---finetune_checkpoint_path $finetune_checkpoint \
+--finetune_checkpoint_path  ./checkpoints/distill_llama3_2_1b_lk_smd_wsw64_fd64_w01_sparse/dl-d=dacxmldl21lswfwflqac000_lzi=1_distill1d-m=distill_llama3_2_1b_lk_smd_wsw64_fd64_w01_sparse-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1-se=0-re=0_ft.pt \
 --model_config_path $model_config_path \
 --finetune_config_path 'configs/experiment/finetune_lora_qkvo_alpaca_clean.yaml' \
 --task lambada_openai --num_shots 0 --verbose --no_cache \

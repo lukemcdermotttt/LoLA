@@ -3,7 +3,7 @@ dataset:
   dataset_config:
     name: default
     path: yahma/alpaca-cleaned
-    chunk_size: 1024
+    chunk_size: 2048
     concat_data: true
     cache_dir: "data/alpaca"
   pretrained_model_config:
