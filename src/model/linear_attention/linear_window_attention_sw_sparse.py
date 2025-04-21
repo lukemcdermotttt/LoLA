@@ -6,8 +6,10 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from einops import rearrange
 from typing import Optional, Tuple
 from .linear_attention import LinearAttentionState, LolcatsLinearAttention
+from flash_attn import flash_attn_func
 
-DEBUG_SHAPES = False       # flip to True for verbose shape prints
+
+DEBUG_SHAPES = True      # flip to True for verbose shape prints
 EPS          = 1e-6           # numerical stabiliser
 # -------------------------------------------------------------------------
 
@@ -18,23 +20,6 @@ def _dbg(tag: str, *tensors):
         print(f"[DBG] {tag:<16}: {shapes}")
 
 
-def _apply_gate(y_nat: torch.Tensor,
-                y_soft: torch.Tensor,
-                gate: torch.Tensor) -> torch.Tensor:
-    """
-    y_*   : [B,H,C,D]  or [B,H,1,D]
-    gate  : broadcastable [1,H₀,1,1]   (H can be H₀ or a multiple of it)
-    """
-    if gate.size(1) != y_nat.size(1):
-        assert y_nat.size(1) % gate.size(1) == 0, \
-            f"gate heads {gate.size(1)} !| y heads {y_nat.size(1)}"
-        gate = gate.repeat_interleave(y_nat.size(1) // gate.size(1), dim=1)
-    return (1. - gate) * y_nat + gate * y_soft
-
-
-# ==========================================================================
-# 1.  Per‑layer state  (unchanged except variable‑length FK_top / V_top) ===
-# ==========================================================================
 class LoLAState(nn.Module):
     """
     LoLA state:
@@ -47,30 +32,45 @@ class LoLAState(nn.Module):
                  device: torch.device | str):
         super().__init__()
         self.C, self.G = C, G
+        #TODO: Get rid of dtypes here, just put it in register buffer
         for name, dt in [
-            ("K_win", dtype), ("V_win", dtype), ("FK_win", dtype), ("win_score", torch.float32),
+            ("K_win", dtype), ("V_win", dtype), ("FK_win", dtype), ("win_score", dtype),
             ("K_top", dtype), ("V_top", dtype), ("FK_top", dtype),
-            ("H_sum", torch.float32), ("S_sum", torch.float32),
-            ("heap_score", torch.float32), ("heap_idx", torch.long),
+            ("H_sum", dtype), ("S_sum", dtype),
+            ("heap_score", dtype)
         ]:
             self.register_buffer(name, torch.empty(0, device=device, dtype=dt))
         self.tokens_seen = 0
 
 
-    # -------------------------------------------------------------- public
     @torch.no_grad()
     def train_chunk(self,
-                    k_c: torch.Tensor,        # [B,H,C,D]
-                    v_c: torch.Tensor,        # [B,H,C,D]
-                    fk_c: torch.Tensor,       # [B,H,C,F]
-                    score_c: torch.Tensor):   # [B,H,C]
-        """Update sliding window + heap + low‑rank sums with one chunk"""
-        B, H, C, D = k_c.shape
-        _dbg("train_chunk/in", k_c, score_c)
-
+                    k_c: torch.Tensor,        # [B,C,H,D]
+                    v_c: torch.Tensor,        # [B,C,H,D]
+                    fk_c: torch.Tensor,       # [B,C,H,F]
+                    score_c: torch.Tensor):   # [B,C,H]
+        """Update sliding window + heap + low-rank sums with one chunk"""
+        B, C, H, D = k_c.shape
+        _, _, _, F = fk_c.shape
+        assert k_c.shape    == (B, C, H, D)
+        assert fk_c.shape    == (B, C, H, F)
+        assert score_c.shape== (B, C, H)
+        #_dbg("train_chunk/in", k_c, score_c)
+        #print('updating chunk, start: ', self.G, self.K_win.size(), self.V_win.size(), self.K_top.size(), self.V_top.size())
         # ---- sliding window --------------------------------------------
         if self.K_win.numel() == 0:
             self.K_win, self.V_win, self.FK_win, self.win_score = k_c.clone(), v_c.clone(), fk_c.clone(), score_c.clone()
+            self.H_sum = torch.zeros((B,H,F,D),device=k_c.device,dtype=k_c.dtype)
+            self.S_sum = torch.zeros((B,H,F),device=k_c.device,dtype=k_c.dtype)
+        elif self.G == 0:
+            #LoLCATs basically
+            self.H_sum += torch.einsum('b c h f, b c h d -> b h f d', self.FK_win, self.V_win)
+            self.S_sum += self.FK_win.sum(1) # [B,H,F]
+
+            self.K_win = k_c
+            self.V_win = v_c
+            self.FK_win = fk_c
+            self.win_score = score_c
         else:
             # ----heap update --------------------------------------------
             if self.heap_score.numel() == 0:
@@ -83,52 +83,51 @@ class LoLAState(nn.Module):
                     self.heap_score = self.win_score
                 else:
                     #Store only top-G of chunk in heap
-                    self.heap_score, top_idx  = self.win_score.topk(self.G, -1,largest=True) # [B,H,G]
-
-                    b = torch.arange(B, device=k_c.device)[:, None, None]
-                    h = torch.arange(H, device=k_c.device)[None, :, None]
-                    self.K_top  = self.K_win[b, h, top_idx]
-                    self.V_top  = self.V_win[b, h, top_idx]
-                    self.FK_top  = self.FK_win[b, h, top_idx]
+                    sorted_idx = self.win_score.argsort(dim=1, descending=True)            # [B,C,H]
+                    top_idx = sorted_idx[:,:self.G,:]                                 # [B,G,H]
+                    bot_idx = sorted_idx[:,self.G:,:]                                 # [B,C-G,H]
+                    self.heap_score = torch.gather(self.win_score, dim=1, index=top_idx)    # [B,G,H]
+                    
+                    self.K_top = torch.gather(self.K_win, dim=1, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,self.K_win.size(-1)))
+                    self.V_top = torch.gather(self.V_win, dim=1, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,self.V_win.size(-1)))
+                    self.FK_top = torch.gather(self.FK_win, dim=1, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,self.FK_win.size(-1)))
 
                     #Store the rest in hidden state
-                    _, bot_idx = self.win_score.topk(C-self.G, -1,largest=False) # [B,H,C-G]
-                    self.H_sum = torch.einsum('b h g f, b h g d -> b h f d',
-                                            self.FK_win[b,h,bot_idx].float(), self.V_win[b,h,bot_idx].float())
-                    self.S_sum = self.FK_win[b,h,bot_idx].float().sum(2) # [B,H,F]
+                    bot_FK = torch.gather(self.FK_win, dim=1, index=bot_idx.unsqueeze(-1).expand(-1,-1,-1,self.FK_win.size(-1)))  # [B,C,H,F]
+                    bot_V  = torch.gather(self.V_win, dim=1, index=bot_idx.unsqueeze(-1).expand(-1,-1,-1,self.V_win.size(-1)))   # [B,C,H,D]
+                    self.H_sum += torch.einsum('b c h f, b c h d -> b h f d', bot_FK, bot_V)
+                    self.S_sum += bot_FK.sum(1) # [B,H,F]
 
-                    assert not (top_idx.unsqueeze(-1) == bot_idx.unsqueeze(-2)).any().item(), "A KV PAIR CANT BE BOTH TOP AND BOTTOM" 
 
-            elif self.heap_score.size(-1)+C <= self.G:
+            elif self.heap_score.size(1)+C <= self.G:
                 #Heap not full
-                self.K_top = torch.cat([self.K_top,self.K_win], 2)
-                self.V_top =  torch.cat([self.V_top,self.V_win], 2)
-                self.FK_top =  torch.cat([self.FK_top,self.FK_win], 2)
-                self.heap_score =  torch.cat([self.heap_score,self.win_score], 2)
+                self.K_top = torch.cat([self.K_top,self.K_win], 1)
+                self.V_top =  torch.cat([self.V_top,self.V_win], 1)
+                self.FK_top =  torch.cat([self.FK_top,self.FK_win], 1)
+                self.heap_score =  torch.cat([self.heap_score,self.win_score], 1)
             
             else:
                 #Compare old heap and chunk leaving sliding window
-                cat_score = torch.cat([self.heap_score, self.win_score], 2)   # [B,H,G+C]
-                cat_K  = torch.cat([self.K_top,self.K_win], 2)
-                cat_V  = torch.cat([self.V_top,self.V_win], 2)
-                cat_FK = torch.cat([self.FK_top,self.FK_win], 2)
+                cat_score = torch.cat([self.heap_score, self.win_score], 1)   # [B,G+C,H]
+                cat_K  = torch.cat([self.K_top,self.K_win], 1)
+                cat_V  = torch.cat([self.V_top,self.V_win], 1)
+                cat_FK = torch.cat([self.FK_top,self.FK_win], 1)
 
-                sorted_idx = cat_score.argsort(dim=-1, descending=True)            # [B,H,G + C]
-                top_idx = sorted_idx[..., :self.G]                                 # [B,H,G]
-                bot_idx = sorted_idx[..., self.G:]                                 # [B,H,C]
-                self.heap_score = torch.gather(cat_score, dim=2, index=top_idx)    # [B,H,G]
+                sorted_idx = cat_score.argsort(dim=1, descending=True)            # [B,G + C,H]
+                top_idx = sorted_idx[:, :self.G,:]                                 # [B,G,H]
+                bot_idx = sorted_idx[:,self.G:,:]                                 # [B,C,H]
+                self.heap_score = torch.gather(cat_score, dim=1, index=top_idx)    # [B,G,H]
                 
-                self.K_top = torch.gather(cat_K, dim=2, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,cat_K.size(-1)))
-                self.V_top = torch.gather(cat_V, dim=2, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,cat_V.size(-1)))
-                self.FK_top = torch.gather(cat_FK, dim=2, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,cat_FK.size(-1)))
+                self.K_top = torch.gather(cat_K, dim=1, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,cat_K.size(-1)))
+                self.V_top = torch.gather(cat_V, dim=1, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,cat_V.size(-1)))
+                self.FK_top = torch.gather(cat_FK, dim=1, index=top_idx.unsqueeze(-1).expand(-1,-1,-1,cat_FK.size(-1)))
 
                 #Store the rest in hidden state
-                bot_FK = torch.gather(cat_FK, dim=2, index=bot_idx.unsqueeze(-1).expand(-1,-1,-1,cat_FK.size(-1)))  # [B,H,C,F]
-                bot_V  = torch.gather(cat_V, dim=2, index=bot_idx.unsqueeze(-1).expand(-1,-1,-1,cat_V.size(-1)))   # [B,H,C,D]
+                bot_FK = torch.gather(cat_FK, dim=1, index=bot_idx.unsqueeze(-1).expand(-1,-1,-1,cat_FK.size(-1)))  # [B,C,H,F]
+                bot_V  = torch.gather(cat_V, dim=1, index=bot_idx.unsqueeze(-1).expand(-1,-1,-1,cat_V.size(-1)))   # [B,C,H,D]
 
-                self.H_sum = torch.einsum('b h g f, b h g d -> b h f d',
-                                        bot_FK.float(), bot_V.float())
-                self.S_sum = bot_FK.float().sum(2) # [B,H,F]
+                self.H_sum += torch.einsum('b c h f, b c h d -> b h f d', bot_FK, bot_V)
+                self.S_sum += bot_FK.sum(1) # [B,H,F]
 
 
             self.K_win = k_c
@@ -137,93 +136,44 @@ class LoLAState(nn.Module):
             self.win_score = score_c
 
         self.tokens_seen += C
-        _dbg("train_chunk/out K_top", self.K_top)
-
-    # ~~~~~~~~~~~~ decode ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    @torch.no_grad()
-    def decode_token(self, k_t: torch.Tensor, v_t: torch.Tensor, fk_t: torch.Tensor):
-        """Append a single KV ( [B,H,D] / [B,H,F] ) during generation"""
-        
-        #NOTE: WE ARE NOT USING CACHING IN DECODING STEP YET.
-        if self.K_win.numel() == 0:
-            self.K_win, self.V_win, self.FK_win = k_t.unsqueeze(2), v_t.unsqueeze(2), fk_t.unsqueeze(2)
-        else:
-            #Store the pair leaving the window in the Hidden State
-            self.H_sum += torch.einsum('b h f, b h d -> b h f d',
-                                   self.FK_win[:,:,:1].float(), self.V_win[:,:,:1].float())
-            self.S_sum +=  self.FK_win[:,:,:1].float()
-            
-            #Slide the window
-            self.K_win = torch.cat([self.K_win[:, :, 1:], k_t.unsqueeze(2)], 2)
-            self.V_win = torch.cat([self.V_win[:, :, 1:], v_t.unsqueeze(2)], 2)
-            self.FK_win = torch.cat([self.FK_win[:, :, 1:], fk_t.unsqueeze(2)], 2)
-
-       
-        self.tokens_seen += 1
 
 
-# ==========================================================================
-# 2.  Core: soft‑max on (window ∪ heap)  +  linear on “others” ============
-# ==========================================================================
-def _softmax_window_plus_heap(q, Kw, Vw, Kh, Vh):
+#BACK UP SOFTMAX
+def _softmax_window_plus_heap(q, K_all, V_all):
+
     """
-    Soft‑max over concatenation of
-        – window keys (Kw,Vw)   length ≤ 2C
-        – heap   keys (Kh,Vh)   length = G
-    Shapes: q [B,H,C,D]   Kw/Vw [B,H,S,D]   Kh/Vh [B,H,G,D]
-    Returns (y_soft, Z_soft) with y_soft in [B,H,C,D]  (unnormed numerator),
-                              Z_soft  in [B,H,C,1]
+    Shapes: q [B,C,H,D]   K_all [B,G,H,D]
+    Returns (y_soft, Z_soft) with y_soft in [B,C,H,D]  (unnormed numerator),
+                              Z_soft  in [B,C,H,1]
     """
-    if Kh.numel() == 0:
-        K_all, V_all = Kw, Vw
-    else:
-        K_all = torch.cat([Kw, Kh], 2)
-        V_all = torch.cat([Vw, Vh], 2)
 
     scale  = K_all.size(-1) ** -0.5
-    logits = torch.einsum('b h q d, b h k d -> b h q k',
-                          q.float(), K_all.float()) * scale
+    logits = torch.einsum('b c h d, b g h d -> b h c g',
+                          q, K_all) * scale
 
-    S = Kw.size(2)
-    G = 0 if Kh.numel() == 0 else Kh.size(2)
-    C = q.size(2)
-    len_prev = S - C                     # keys from previous chunk
-    causal = torch.ones((q.size(2), K_all.size(2)), device=q.device).tril(len_prev).bool()[None,None,:]
+    C = q.size(1)
+    len_prev = K_all.size(1) - C                     # keys from previous chunk
+    causal = torch.ones((q.size(1), K_all.size(1)), device=q.device).tril(len_prev).bool()[None,None,:]
     logits = logits.masked_fill(~causal, -1e9)
-
-    #exp_l   = logits.exp()                          # [B,H,C,S+G]
     exp_l = torch.exp(logits - logits.amax(dim=-1, keepdim=True)) #NOTE: We should be using this.
-    Z_soft  = exp_l.sum(-1, keepdim=True)
-    y_soft  = torch.einsum('... q k, ... k d -> ... q d', exp_l, V_all.float())
+    Z_soft  = exp_l.sum(-1).transpose(-1,-2).unsqueeze(-1) #[B C H 1]
+    y_soft  = torch.einsum('b h c g, b g h d -> b c h d', exp_l, V_all)
     return y_soft, Z_soft
 
 
-def _linear_other(q_f,       # [B,H,C,F]
-                  fk_sum,    # [B,H,F,D]
-                  s_sum):     # [B,H,F]
-                        
-    """
-    Low‑rank path on *all* tokens that live outside window ∪ heap.
-    """
-    if fk_sum.numel() == 0:
-        return 0, 0
-    y_lin = torch.einsum('b h c f, b h f d -> b h c d', q_f.float(), fk_sum)
-    Z_lin = torch.einsum('b h c f, b h f -> b h c',    q_f.float(), s_sum).unsqueeze(-1)
-    return y_lin, Z_lin
 
 
 # ==========================================================================
 # 3.  Chunked forward ======================================================
 # ==========================================================================
 def _lola_forward(
-        q, k, v, fq, fk, *,
+        q, k, v, fq, fk, *, #[B, H, L, D]
         C: int,
         state: LoLAState,
         gate: torch.Tensor) -> Tuple[torch.Tensor, LoLAState]:
     """
     All tensors come in as [B,H,L,D] (or [B,H,L,F] for fq/fk).
     """
-
     #Pad the sequences, so it can be chunked.
     B, H, L, D = q.shape
     pad = (C - L % C) % C
@@ -235,65 +185,57 @@ def _lola_forward(
         L += pad
     N = L // C
 
-    # chunk views ----------------------------------------------------------
-    q_c, k_c, v_c = (rearrange(t, 'b h (n c) d -> n b h c d', c=C)
-                     for t in (q, k, v))
-    fq_c, fk_c =   (rearrange(t, 'b h (n c) f -> n b h c f', c=C)
-                     for t in (fq, fk))
+    q_c, k_c, v_c = (rearrange(t, 'b h (n c) d -> n b c h d', c=C) for t in (q, k, v))
+    fq_c, fk_c =   (rearrange(t, 'b h (n c) f -> n b c h f', c=C) for t in (fq, fk))
+    
+    gate = gate.transpose(1,2).to(q.device, dtype=q.dtype) #(1,H,1,1)->(1,1,H,1)
+    out = torch.empty((B, L, H, D), device=q.device, dtype=q.dtype)
 
-    out = torch.empty_like(q)
     for n in range(N):
-        qn, kn, vn  = q_c[n], k_c[n], v_c[n]
-        fq_n, fk_n  = fq_c[n], fk_c[n]
-
-        prev_k, prev_v = (k_c[n-1], v_c[n-1]) if n else (kn[:, :, :0], vn[:, :, :0])
-        prev_fk        = fk_c[n-1]           if n else fk_n[:, :, :0]
-
-        # ---- soft‑max over window ∪ heap --------------------------------
-        Kw = torch.cat([prev_k, kn], 2)
-        Vw = torch.cat([prev_v, vn], 2)
-        y_soft_num, Z_soft = _softmax_window_plus_heap(
-            qn, Kw, Vw, state.K_top, state.V_top)
-
-        # ---- linear on "others" -----------------------------------------
-        #   cumulative sums in state already exclude window & heap keys
-        y_lin_num, Z_lin = _linear_other(fq_n, state.H_sum, state.S_sum)
-
-        # ---- natural mixture & gate -------------------------------------
-        #y_nat = (y_soft_num + y_lin_num) / (Z_soft + Z_lin + EPS)
-        #y     = _apply_gate(y_nat, y_soft_num / (Z_soft + EPS), gate)
+        # Step 1 ---- soft‑max over window ∪ heap --------------------------------
         """
-        if isinstance(y_lin_num,torch.Tensor):
-            print('gate value across 5 heads', gate[0,:5,0,0])
-            print('normalized ysoft', (y_soft_num / (Z_soft + EPS))[0,0,:5,0])
-            print('normalized ylin', (y_lin_num / (Z_lin + EPS))[0,0,:5,0])
-            print('ysoft_num', (y_soft_num)[0,0,:5,0])
-            print('ylin_num', (y_lin_num)[0,0,:5,0])
-            print('gated_num', (y_soft_num*gate + y_lin_num*(1-gate))[0,0,:5,0])
-            print('Z_soft across 5 tokens', Z_soft[0,0,:5])
-            print('Z_lin across 5 tokens', Z_lin[0,0,:5])
-        """
-        if isinstance(y_lin_num,torch.Tensor):
-            y = (y_soft_num*(1-gate) + y_lin_num*(gate)) / (Z_soft*(1-gate) + Z_lin*(gate) + EPS) 
-            #y = (y_soft_num*gate + y_lin_num*(1-gate)) / (Z_soft*gate + Z_lin*(1-gate) + EPS) #NOTE: IDEAL GATING, BUT THE ONE ABOVE GETS 48%. THIS GETS 0%.
+        if n>0:
+            union_K = torch.cat([state.K_top, k_c[n-1], k_c[n]], dim=1) #cat (B C H D) along C
+            union_V = torch.cat([state.V_top, v_c[n-1], v_c[n]], dim=1)
         else:
-            y = y_soft_num*(1-gate) / (Z_soft*(1-gate) + EPS)
+            union_K = torch.cat([state.K_top, k_c[n]], dim=1) #cat (B C H D) along C
+            union_V = torch.cat([state.V_top, v_c[n]], dim=1)
+        """
+        union_K = torch.cat([state.K_top, state.K_win, k_c[n]], dim=1) #cat (B C H D) along C
+        union_V = torch.cat([state.V_top, state.V_win, v_c[n]], dim=1)
 
-        out[:, :, n*C:(n+1)*C] = y
+        y_soft, softmax_lse, S_dmask = flash_attn_func(q_c[n], union_K, union_V, causal=True, return_attn_probs=True) #softmax_lse is shape [B H C]
+        Z_soft = torch.exp(softmax_lse).transpose(1,2).unsqueeze(-1)# was torch.exp(softmax_lse).transpose(-1,-2).unsqueeze(-1) since flash attention returns logsumexp
+        y_soft_num = y_soft * Z_soft #B C H D 
 
-        # ---- residual score (error if we linearise the *window*) --------
-        lin_win_num, lin_win_den = _linear_other(fq_n,
-                                                 torch.einsum('b h k f, b h k d -> b h f d',
-                                                              torch.cat([prev_fk, fk_n], 2).float(),
-                                                              Vw.float()),
-                                                 torch.cat([prev_fk, fk_n], 2).float().sum(2))
-        y_lin_win = lin_win_num / (lin_win_den + EPS)
-        resid     = (y_soft_num / (Z_soft + EPS) - y_lin_win).detach().mean(2)
-        score_c   = torch.einsum('b h d, b h c d -> b h c', resid.float(), vn.float()).abs()
+        #y_soft_num, Z_soft = _softmax_window_plus_heap(q_c[n], union_K, union_V)
+        #y_soft = y_soft_num / (Z_soft + EPS)
+        #print('flash y vs. y soft: ', flash_y_soft[0,:5,0,0], y_soft[0,:5,0,0])
 
-        state.train_chunk(kn, vn, fk_n, score_c)
+        # Step 2 ---- scores --------------------------------
+        if n>0:
+            union_FK = torch.cat([state.FK_top, fk_c[n-1], fk_c[n]], dim=1) #cat (B C H F) along C
+        else:
+            union_FK = torch.cat([state.FK_top, fk_c[n]], dim=1) #cat (B C H F) along C
 
-    return out[:, :, :L-pad], state 
+        fqk = torch.einsum('b c h f, b g h f -> b c h g', fq_c[n], union_FK)
+        y_lin_win= torch.einsum('b c h g, b g h d -> b c h d', fqk, union_V) / (fqk.sum(-1,keepdims=True) + EPS)
+        resid     = (y_soft - y_lin_win).detach().mean(1)
+        score_c   = torch.einsum('b h d, b c h d -> b c h', resid, v_c[n]).abs() #used to have .abs(), what if we normalized resid & v's?
+
+        # Step 3 ---- linear attention on others --------------------------------
+        if state.H_sum.numel() == 0:
+            out[:, n*C:(n+1)*C] = y_soft
+        else:
+            y_lin_num = torch.einsum('b c h f, b h f d -> b c h d', fq_c[n], state.H_sum)
+            Z_lin = torch.einsum('b c h f, b h f -> b c h',    fq_c[n], state.S_sum).unsqueeze(-1)
+            y = (y_soft_num*(gate) + y_lin_num*(1-gate)) / (Z_soft*(gate) + Z_lin*(1-gate) + EPS)  #This is how it should work.
+            #y = (y_soft_num*(1-gate) + y_lin_num*(gate)) / (Z_soft*(1-gate) + Z_lin*(gate) + EPS) #This is how it worked last night...
+            out[:, n*C:(n+1)*C] = y
+
+        state.train_chunk(k_c[n], v_c[n], fk_c[n], score_c) #Update LoLA State
+
+    return out[:, :L-pad], state 
 
 
 # ==========================================================================
@@ -307,64 +249,75 @@ def _lola_decode(
         C: int,
         state: LoLAState,
         gate: torch.Tensor):
-    print('DECODING: ERORR NOT SUPPORTED I THINK')
-    if state.tokens_seen == 0:                         # bootstrap
-        state.decode_token(k.squeeze(2), v.squeeze(2), fk.squeeze(2))
-        return v, state
 
-    y_soft_num, Z_soft = _softmax_window_plus_heap(
-        q, state.K_win, state.V_win,
-        state.K_top, state.V_top)
+    #BUG: DECODE DOESNT UPDATE SPARSE CACHING YET
+    #print(torch.norm(state.H_sum))
+    #(B H L D) -> (B L H D)
+    #gate = gate.transpose(1,2)
 
-    y_lin_num, Z_lin = _linear_other(fq, state.H_sum, state.S_sum)
-    y_nat  = (y_soft_num + y_lin_num) / (Z_soft + Z_lin + EPS)
-    y_out  = _apply_gate(y_nat, y_soft_num / (Z_soft + EPS), gate)
+    q, k, v, fq, fk = (t.transpose(1,2) for t in (q, k, v, fq, fk))
+    
+    keys = torch.cat([state.K_top, state.K_win], dim=1)
+    values = torch.cat([state.V_top, state.V_win], dim=1)
+    y_soft, softmax_lse, S_dmask = flash_attn_func(q, keys, values, return_attn_probs=True, causal=True) #softmax_lse is shape [B H C]
+    #Z_soft = torch.exp(softmax_lse).transpose(1,2).unsqueeze(-1)# was torch.exp(softmax_lse).transpose(-1,-2).unsqueeze(-1) since flash attention returns logsumexp
+    #y_soft_num = y_soft * Z_soft
 
-    state.decode_token(k.squeeze(2), v.squeeze(2), fk.squeeze(2))
-    return y_out, state
+    #y_lin_num = torch.einsum('b c h f, b h f d -> b c h d', fq, state.H_sum)
+    #Z_lin = torch.einsum('b c h f, b h f -> b c h',    fq, state.S_sum).unsqueeze(-1)
+    #y_out = (y_soft_num*(gate) + y_lin_num*(1-gate)) / (Z_soft*(gate) + Z_lin*(1-gate) + EPS)  #This is how it should work.
+    #y_out = (y_soft_num*(1-gate) + y_lin_num*(gate)) / (Z_soft*(1-gate) + Z_lin*(gate) + EPS) #This is how it worked last night...
+    
+
+    #Update LoLA State
+    #state.H_sum += torch.einsum('b h f, b h d -> b h f d', state.FK_win[:,0], state.V_win[:,0])
+    #state.S_sum += state.FK_win[:,0]
+    #state.FK_win = torch.cat([state.FK_win[:,1:],fk],dim=1)
+    state.K_win = torch.cat([state.K_win[:,1:],k],dim=1)
+    state.V_win = torch.cat([state.V_win[:,1:],v],dim=1)
+    state.tokens_seen += 1
+    
+    return y_soft.to(q.dtype), state
+    #return y_out.to(q.dtype), state
 
 
 # ==========================================================================
 # 5.  Public wrapper (permutes once) =======================================
 # ==========================================================================
 def lola_sparse_compatible(
-    q, k, fq, fk, v,
-    window_factor, linear_factor,      # linear_factor kept for API parity
+    q, k, fq, fk, v, # [B,H,L,D]
+    window_factor,
     *, window_size: int,
     global_cache_size: int,
     kv_state: Optional['LinearAttentionSparseSlidingWindowCache'] = None,
     **_,
 ):
-    C = window_size
-    state = kv_state.state if kv_state else LoLAState(C, global_cache_size, q.dtype, q.device)
-    gate  = window_factor.to(dtype=q.dtype)            # [1,H₀,1,1]
+    if q.size(2) > 1:
+        state = LoLAState(window_size, global_cache_size, q.dtype, q.device)
+    else:
+        # only reuse the cache for true step‑by‑step generation (q.size(1)==1)
+        state = kv_state.state if kv_state and kv_state.state else LoLAState(window_size, global_cache_size, q.dtype, q.device)
 
-    # external [B,L,H,D] → internal [B,H,L,D]
-    qh, kh, vh, fqh, fkh = (t for t in (q, k, v, fq, fk)) # was t.permute(0, 2, 1, 3)
-    _dbg("wrapper/in", qh, gate)
 
-    if q.size(1) > 1:                          # pre‑fill / training
-        y_h, state = _lola_forward(qh, kh, vh, fqh, fkh,
-                                   C=C, state=state, gate=gate)
-    else:                                      # generation
-        y_h, state = _lola_decode(qh, kh, vh, fqh, fkh,
-                                  C=C, state=state, gate=gate)
-
-    y = y_h.permute(0, 2, 1, 3)                # back to [B,L,H,D]
+    if q.size(2) > 1: # pre‑fill / training
+        y, state = _lola_forward(q, k, v, fq, fk, C=window_size, state=state, gate=window_factor)
+    else: # generation
+        y, state = _lola_decode(q, k, v, fq, fk, C=window_size, state=state, gate=window_factor)
 
     if kv_state is None:
         kv_state = LinearAttentionSparseSlidingWindowCache(
-            window_size=C, global_cache_size=global_cache_size,
+            window_size=window_size, global_cache_size=global_cache_size,
             dtype=q.dtype, device=q.device)
     kv_state.state = state
     return y, None, kv_state
+
 
 
 # ==========================================================================
 # 6.  HF module wrapper ====================================================
 # ==========================================================================
 class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
-    def __init__(self, *, window_size=64, global_cache_size=128,
+    def __init__(self, *, window_size=128, global_cache_size=0,
                  init_window_factor=0.0, train_window_factor=True, **kw):
         super().__init__(**kw)
         self.window_size = window_size
@@ -386,7 +339,7 @@ class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
         f_q, f_k = self.feature_map_q(q), self.feature_map_k(k)
         y, _, new_state = self.quadratic_attention(
             q, k, f_q, f_k, v,
-            torch.sigmoid(self.window_factors), 1.0,
+            torch.sigmoid(self.window_factors),
             window_size=self.window_size,
             global_cache_size=self.global_cache_size,
             kv_state=past_key_value)
@@ -396,9 +349,9 @@ class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
 
 # ==========================================================================
 class LinearAttentionSparseSlidingWindowCache(LinearAttentionState):
-    def __init__(self, *, window_size=64, global_cache_size=128,
+    def __init__(self, *, window_size=128, global_cache_size=0,
                  dtype=torch.bfloat16, device='cuda'):
         super().__init__()
-        self.state = LoLAState(window_size, global_cache_size, dtype, device)
+        self.state =LoLAState(window_size, global_cache_size, dtype, device)
         self.kv_states.append(self.state.H_sum)
         self.k_states.append(self.state.S_sum)
