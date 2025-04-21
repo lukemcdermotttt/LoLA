@@ -33,6 +33,7 @@ class LoLAState(nn.Module):
         super().__init__()
         self.C, self.G = C, G
         #TODO: Get rid of dtypes here, just put it in register buffer
+
         for name, dt in [
             ("K_win", dtype), ("V_win", dtype), ("FK_win", dtype), ("win_score", dtype),
             ("K_top", dtype), ("V_top", dtype), ("FK_top", dtype),
@@ -41,6 +42,8 @@ class LoLAState(nn.Module):
         ]:
             self.register_buffer(name, torch.empty(0, device=device, dtype=dt))
         self.tokens_seen = 0
+
+        #self.K, self.V, self.FK = None, None, None
 
 
     @torch.no_grad()
@@ -57,6 +60,22 @@ class LoLAState(nn.Module):
         assert score_c.shape== (B, C, H)
         #_dbg("train_chunk/in", k_c, score_c)
         #print('updating chunk, start: ', self.G, self.K_win.size(), self.V_win.size(), self.K_top.size(), self.V_top.size())
+
+        """
+        NEW LOLA PLAN, ALLOCATE TENSORS TOGETHER FOR NO CONCATS
+        if self.K is None:
+            self.K = torch.zeros((B,self.C + self.G,H,D),device=k_c.device,dtype=k_c.dtype)
+            self.V = torch.zeros((B,self.C + self.G,H,D),device=k_c.device,dtype=k_c.dtype)
+            self.FK = torch.zeros((B,self.C + self.G,H,F),device=k_c.device,dtype=k_c.dtype)
+            self.score = torch.zeros((B,self.C + self.G,H),device=k_c.device,dtype=k_c.dtype)
+            
+        if self.tokens_seen + C > self.C
+
+
+        """
+
+
+
         # ---- sliding window --------------------------------------------
         if self.K_win.numel() == 0:
             self.K_win, self.V_win, self.FK_win, self.win_score = k_c.clone(), v_c.clone(), fk_c.clone(), score_c.clone()
@@ -174,6 +193,7 @@ def _lola_forward(
     """
     All tensors come in as [B,H,L,D] (or [B,H,L,F] for fq/fk).
     """
+
     #Pad the sequences, so it can be chunked.
     B, H, L, D = q.shape
     pad = (C - L % C) % C
@@ -250,15 +270,16 @@ def _lola_decode(
         state: LoLAState,
         gate: torch.Tensor):
 
+    print('DECODING: THIS IS NOT UPDATED YET')
     #BUG: DECODE DOESNT UPDATE SPARSE CACHING YET
     #print(torch.norm(state.H_sum))
     #(B H L D) -> (B L H D)
     #gate = gate.transpose(1,2)
 
-    q, k, v, fq, fk = (t.transpose(1,2) for t in (q, k, v, fq, fk))
+    q, k, v, fq, fk, gate = (t.transpose(1,2) for t in (q, k, v, fq, fk, gate))
     
-    keys = torch.cat([state.K_top, state.K_win], dim=1)
-    values = torch.cat([state.V_top, state.V_win], dim=1)
+    keys = torch.cat([state.K_top, state.K_win, k], dim=1)
+    values = torch.cat([state.V_top, state.V_win, v], dim=1)
     y_soft, softmax_lse, S_dmask = flash_attn_func(q, keys, values, return_attn_probs=True, causal=True) #softmax_lse is shape [B H C]
     #Z_soft = torch.exp(softmax_lse).transpose(1,2).unsqueeze(-1)# was torch.exp(softmax_lse).transpose(-1,-2).unsqueeze(-1) since flash attention returns logsumexp
     #y_soft_num = y_soft * Z_soft
@@ -344,7 +365,8 @@ class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
             global_cache_size=self.global_cache_size,
             kv_state=past_key_value)
         y = rearrange(y, 'b l h d -> b l (h d)')
-        return self.o_proj(y), None, (new_state if use_cache else None)
+
+        return self.o_proj(y), new_state, None #(new_state if use_cache else None)
 
 
 # ==========================================================================

@@ -24,7 +24,7 @@ python eval_lm_harness.py \
 --finetune_checkpoint_path 'hazyresearch/lolcats-llama-3.1-8b-ft-lora' \
 --model_config_path "configs/model/inference_llama3_1_8b_lola.yaml" \
 --finetune_config_path 'configs/experiment/finetune_lora_qkvo_alpaca_clean.yaml' \
---task wikitext --num_shots 0 --verbose \
+--task wikitext --num_shots 0 --verbose\
 --project_name lolcat \
 --wandb_entity lmcdermo
 """
