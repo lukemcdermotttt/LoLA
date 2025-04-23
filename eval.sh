@@ -9,13 +9,12 @@ python eval_lm_harness.py \
 --finetune_checkpoint_path 'hazyresearch/lolcats-llama-3.1-8b-ft-lora' \
 --model_config_path "configs/model/inference_llama3_1_8b_lola.yaml" \
 --finetune_config_path 'configs/experiment/finetune_lora_qkvo_alpaca_clean.yaml' \
---task niah_single_1 --num_shots 0 --verbose \
+--task niah_single_3 --num_shots 0 --verbose \
 --project_name lolcat \
 --wandb_entity lmcdermo \
---metadata='{"max_seq_lengths":[512],"tokenizer":"meta-llama/Llama-3.1-8B-Instruct"}' #for some reason the base model tokenizer broke so.
+--metadata='{"max_seq_lengths":[1024],"tokenizer":"meta-llama/Llama-3.1-8B-Instruct"}' #for some reason the base model tokenizer broke so.
 #'hazyresearch/lolcats-llama-3.1-8b-distill' \
 #'hazyresearch/lolcats-llama-3.1-8b-ft-lora' \
-
 
 """
 python eval_lm_harness.py \
@@ -24,7 +23,7 @@ python eval_lm_harness.py \
 --finetune_checkpoint_path 'hazyresearch/lolcats-llama-3.1-8b-ft-lora' \
 --model_config_path "configs/model/inference_llama3_1_8b_lola.yaml" \
 --finetune_config_path 'configs/experiment/finetune_lora_qkvo_alpaca_clean.yaml' \
---task wikitext --num_shots 0 --verbose\
+--task triviaqa --num_shots 0 --verbose \
 --project_name lolcat \
 --wandb_entity lmcdermo
 """
@@ -36,7 +35,7 @@ python eval_lm_harness.py \
 --finetune_checkpoint_path 'checkpoints/distill_llama3_2_1b_lk_smd_wsw64_fd64_w01/dl-d=dacxmldl21lswfwflqac000_lzi=1_distill1d-m=distill_llama3_2_1b_lk_smd_wsw64_fd64_w01-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1-se=0-re=0_ft.pt' \
 --model_config_path "configs/model/inference_llama3_2_1b_lola.yaml" \
 --finetune_config_path 'configs/experiment/finetune_lora_qkvo_alpaca_clean.yaml' \
---task wikitext --num_shots 0 --verbose \
+--task longbench_multi_news_e --num_shots 0 --verbose \
 --project_name lolcat \
 --wandb_entity lmcdermo
 #openbookqa, normally .29 acc & 39.4 acc_norm on llama1b.
@@ -52,9 +51,9 @@ python eval_lm_harness.py \
 --task niah_single_1 --num_shots 0 --verbose \
 --project_name lolcat \
 --wandb_entity lmcdermo \
---batch_size 256 \
 --metadata='{"max_seq_lengths":[1024],"tokenizer":"meta-llama/Llama-3.2-1B"}' #for some reason the base model tokenizer broke so.
 """
+
 #python eval_lm_harness.py \
 #--model_type lolcats_ckpt \
 #--attn_mlp_checkpoint_path 'checkpoints/distill_llama3_2_1b_lk_smd_wsw64_fd64_w01/dl-d=distill_alpaca_clean_xent0_mse1000_lr1e-2-m=distill_llama3_2_1b_lk_smd_wsw64_fd64_w01-f=finetune_lora_qkvo_alpaca_clean-s=0-se=0-re=0-lzi=1_distill.pt' \
