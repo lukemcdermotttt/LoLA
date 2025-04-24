@@ -223,6 +223,7 @@ def main():
     else:
         tasks = [args.task]
 
+    model.batch_size_per_gpu = args.batch_size
     results = evaluator.simple_evaluate(
         model=model,  
         model_args='',  

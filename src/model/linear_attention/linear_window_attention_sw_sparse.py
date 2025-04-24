@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# linear_window_attention_sw_sparse.py ― LoLA (window + sparse + linear)
+# linear_window_attention_sw_sparse.py ― LoLA (window + sparse + linear)
 # Pure‑PyTorch (no Triton) — causal, naturally‑mixed, with shape asserts
 # ---------------------------------------------------------------------------
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -18,138 +18,6 @@ def _dbg(tag: str, *tensors):
     if DEBUG_SHAPES:
         shapes = ", ".join(str(tuple(t.shape)) for t in tensors)
         print(f"[DBG] {tag:<16}: {shapes}")
-
-
-
-class State(nn.Module):
-    def __init__(self, C: int, G: int, dtype: torch.dtype, device: torch.device | str):
-        super().__init__()
-        """
-        Cache is set up, so K V and FK hold both sparse cache and sliding window (including current chunk)
-        K = [ SPARSE CACHE | LAST CHUNK | CURRENT CHUNK ] #shape (B,max_cache_size,H,D) ... same for V, FK except FK has a final F dim instead of D
-        
-        """
-        self.C, self.G = C, G
-        self.K, self.V, self.FK, self.H, self.S = None, None, None, None, None #check _init_state for info
-        self.tokens_seen = 0
-        self.max_cache_size = 2*self.C + self.G
-        
-
-    def _init_state(self, k_c, fk_c):
-        B, C, H, D = k_c.shape
-        _, _, _, F = fk_c.shape
-        dtype, device = k_c.dtype, k_c.device
-
-        self.K = torch.zeros((B,self.max_cache_size,H,D),device=device,dtype=dtype) #Keys
-        self.V = torch.zeros((B,self.max_cache_size,H,D),device=device,dtype=dtype) #Values
-        self.FK = torch.zeros((B,self.max_cache_size,H,F),device=device,dtype=dtype) #Phi(K) for Linear Attn.
-        self.H = torch.zeros((B,H,F,D),device=device,dtype=dtype) #Hidden State in Linear Attn.
-        self.S = torch.zeros((B,H,F),device=device,dtype=dtype) #Normalizing State in Linear Attn.
-
-    def update(self, k_c, v_c, fk_c):
-        B, C, H, D = k_c.shape
-        if self.K is None: self._init_state(k_c, fk_c)
-
-        if self.tokens_seen + C < self.max_cache_size: #Cache isn't full
-            self.K[:,self.tokens_seen: self.tokens_seen+C] = k_c
-            self.V[:,self.tokens_seen: self.tokens_seen+C] = v_c
-            self.FK[:,self.tokens_seen: self.tokens_seen+C] = fk_c
-            self.tokens_seen += C
-            #return 
-        
-        else: #Make space in the cache by sending excess tokens to the hidden state
-            num_excess_tokens = self.G+self.C-self.tokens_seen-1 #TODO: Triple check this is correct.
-            num_comparisons = self.G+num_excess_tokens #TODO: Make this whole thing simpler. Only using this rn as its explainable.
-
-            #What is the current memory's prediction of the value? Keep the KV-pairs with high prediction error
-            #Pretend the key is a future query
-            numerator, denominator = self.linear_attn_forward(self.FK[:,:num_comparisons]) # (B, num_comparisons, H, D)
-            V_pred = numerator / denominator
-            pred_err = torch.norm(V_pred - self.V[:,:num_comparisons],dim=-1) # (B, num_comparisons, H)
-
-            sorted_idx = pred_err.argsort(dim=1, descending=False) #NOTE: This is slow. Using this for now as its simple. (B, num_comparisons, H) 
-            self.K[:,:num_comparisons] = self.K[:,:num_comparisons][sorted_idx] #Ensure the top-G errors are the last G-many in [0, num_comparisons]
-            self.V[:,:num_comparisons] = self.V[:,:num_comparisons][sorted_idx]
-            self.FK[:,:num_comparisons] = self.FK[:,:num_comparisons][sorted_idx]
-            
-            self._update_hidden_state(self.FK[:,:num_comparisons-self.G],self.V[:,:num_comparisons-self.G]) #Add low error pairs to self.H & self.S
-
-            #roll num_comparisons-self.G to the left, ensuring K is [ Top G Pairs | Last Chunk | Low Error Pairs ]
-            self.K = torch.roll(self.K, -(num_comparisons-self.G), 1)
-            self.V = torch.roll(self.V, -(num_comparisons-self.G), 1)
-            self.FK = torch.roll(self.FK, -(num_comparisons-self.G), 1)
-
-            #Then replace the low error pairs with the incoming chunk since we already updated the hidden state.
-            self.K[-(num_comparisons-self.G):] = k_c
-            self.V[-(num_comparisons-self.G):] = v_c
-            self.FK[-(num_comparisons-self.G):] = fk_c
-
-            self.tokens_seen += C
-            #return
-
-
-            #make space. we have  self.max_cache_size-(self.tokens_seen+C+1) too many tokens
-            #self.G + self.max_cache_size-(self.tokens_seen+C+1) --> self.G
-            #G + (2C + G) - (tokens_seen + C + 1) = 2G + C - tokens_seen - 1 -> G
-            #score the first [:(2G+C-self.tokens_seen-1)] & take top self.G
-            
-
-    def linear_attn_forward(self, fq):
-        if self.H_sum is None: return 0, EPS
-        y_numerator = torch.einsum('b c h f, b h f d -> b c h d', fq, self.H_sum)
-        y_denominator = torch.einsum('b c h f, b h f -> b c h', fq, self.S_sum).unsqueeze(-1)
-        return y_numerator, y_denominator
-
-    def _update_hidden_state(self, fk, v):
-        self.H_sum += torch.einsum('b c h f, b c h d -> b h f d', fk, v)
-        self.S_sum += fk.sum(1) # [B,H,F]
-        
-def _new_lola_forward(
-        q, k, v, fq, fk, *, #[B, H, L, D]
-        C: int,
-        state: State,
-        gate: torch.Tensor) -> Tuple[torch.Tensor, State]:
-    """
-    All tensors come in as [B,H,L,D] (or [B,H,L,F] for fq/fk).
-    """
-
-    #Pad the sequences, so it can be chunked.
-    B, H, L, D = q.shape
-    pad = (C - L % C) % C
-    if pad:
-        pad_qd = torch.zeros(B, H, pad, D,         dtype=q.dtype,  device=q.device)
-        pad_f  = torch.zeros(B, H, pad, fq.size(-1), dtype=fq.dtype, device=q.device)
-        q, k, v = [torch.cat([t, pad_qd], 2) for t in (q, k, v)]
-        fq, fk  = [torch.cat([t, pad_f ], 2) for t in (fq, fk)]
-        L += pad
-    N = L // C
-
-    q_c, k_c, v_c = (rearrange(t, 'b h (n c) d -> n b c h d', c=C) for t in (q, k, v))
-    fq_c, fk_c =   (rearrange(t, 'b h (n c) f -> n b c h f', c=C) for t in (fq, fk))
-    
-    gate = gate.transpose(1,2).to(q.device, dtype=q.dtype) #(1,H,1,1)->(1,1,H,1)
-    out = torch.empty((B, L, H, D), device=q.device, dtype=q.dtype)
-
-    for n in range(N):
-        #Update cache
-        state.update(k_c[n], v_c[n], fk_c[n])
-
-        #Sparse Attention
-        y_soft, softmax_lse, _ = flash_attn_func(q_c[n], state.K[:,:state.tokens_seen], 
-                                                               state.V[:,:state.tokens_seen],
-                                                            causal=True, return_attn_probs=True)
-        y_soft_den = torch.exp(softmax_lse).transpose(1,2).unsqueeze(-1)
-        y_soft_num = y_soft * y_soft_den #(B C H D)
-
-        #Linear Attention
-        y_lin_num, y_lin_den = state.linear_attn_forward(fq_c[n])
-
-        #Fuse outputs
-        y = (y_soft_num*(gate) + y_lin_num*(1-gate)) / (y_soft_den*(gate) + y_lin_den*(1-gate) + EPS)
-        out[:, n*C:(n+1)*C] = y
-
-
-    return out[:, :L-pad], state
 
 
 
@@ -281,31 +149,6 @@ class LoLAState(nn.Module):
         self.tokens_seen += C
 
 
-#BACK UP SOFTMAX
-def _softmax_window_plus_heap(q, K_all, V_all):
-
-    """
-    Shapes: q [B,C,H,D]   K_all [B,G,H,D]
-    Returns (y_soft, Z_soft) with y_soft in [B,C,H,D]  (unnormed numerator),
-                              Z_soft  in [B,C,H,1]
-    """
-
-    scale  = K_all.size(-1) ** -0.5
-    logits = torch.einsum('b c h d, b g h d -> b h c g',
-                          q, K_all) * scale
-
-    C = q.size(1)
-    len_prev = K_all.size(1) - C                     # keys from previous chunk
-    causal = torch.ones((q.size(1), K_all.size(1)), device=q.device).tril(len_prev).bool()[None,None,:]
-    logits = logits.masked_fill(~causal, -1e9)
-    exp_l = torch.exp(logits - logits.amax(dim=-1, keepdim=True)) #NOTE: We should be using this.
-    Z_soft  = exp_l.sum(-1).transpose(-1,-2).unsqueeze(-1) #[B C H 1]
-    y_soft  = torch.einsum('b h c g, b g h d -> b c h d', exp_l, V_all)
-    return y_soft, Z_soft
-
-
-
-
 # ==========================================================================
 # 3.  Chunked forward ======================================================
 # ==========================================================================
@@ -336,7 +179,7 @@ def _lola_forward(
     out = torch.empty((B, L, H, D), device=q.device, dtype=q.dtype)
 
     for n in range(N):
-        # Step 1 ---- soft‑max over window ∪ heap --------------------------------
+        # Step 1 ---- soft‑max over window ∪ heap --------------------------------
         union_K = torch.cat([state.K_top, state.K_win, k_c[n]], dim=1) #cat (B C H D) along C
         union_V = torch.cat([state.V_top, state.V_win, v_c[n]], dim=1)
 
@@ -433,7 +276,7 @@ def _lola_decode(
 # 5.  Public wrapper (permutes once) =======================================
 # ==========================================================================
 def lola_sparse_compatible(
-    q, k, fq, fk, v, # [B,H,L,D]
+    q, k, fq, fk, v, # [B,H,L,D]
     window_factor,
     *, window_size: int,
     global_cache_size: int,
@@ -460,10 +303,6 @@ def lola_sparse_compatible(
     return y, None, kv_state
 
 
-
-# ==========================================================================
-# 6.  HF module wrapper ====================================================
-# ==========================================================================
 class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
     def __init__(self, *, window_size=512, global_cache_size=512,
                  init_window_factor=0.0, train_window_factor=True, **kw):
@@ -496,7 +335,6 @@ class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
         return self.o_proj(y), new_state, None #(new_state if use_cache else None)
 
 
-# ==========================================================================
 class LinearAttentionSparseSlidingWindowCache(LinearAttentionState):
     def __init__(self, *, window_size=512, global_cache_size=512,
                  dtype=torch.bfloat16, device='cuda'):
