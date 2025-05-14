@@ -16,10 +16,13 @@ python eval_lm_harness.py \
 --max_batch_size 1 \
 --project_name lolcat \
 --wandb_entity lmcdermo \
---metadata='{"max_seq_lengths":[4096],"tokenizer":"meta-llama/Llama-3.1-8B-Instruct"}' #for some reason the base model tokenizer broke so.
+--metadata='{"max_seq_lengths":[2048],"tokenizer":"meta-llama/Llama-3.1-8B-Instruct"}' #for some reason the base model tokenizer broke so.
 #'hazyresearch/lolcats-llama-3.1-8b-distill' \
 #'hazyresearch/lolcats-llama-3.1-8b-ft-lora' \
-#--limit 30 \
+
+
+
+
 
 """
 python eval_lm_harness.py \

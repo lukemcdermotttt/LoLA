@@ -120,7 +120,7 @@ class LolcatsLlamaModel(LlamaModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -147,6 +147,10 @@ class LolcatsLlamaModel(LlamaModel):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                 )
+            
+            #if layer_idx == 20: 
+            #    return #NOTE: REMOVE
+
 
             hidden_states = layer_outputs[0]
 

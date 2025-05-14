@@ -39,7 +39,8 @@ class LoLAState(nn.Module):
             ("K_win", dtype), ("V_win", dtype), ("FK_win", dtype),
             ("K_top", dtype), ("V_top", dtype), ("FK_top", dtype),
             ("H_sum", dtype), ("S_sum", dtype),
-            ("heap_score", dtype)
+            ("heap_score", dtype),
+            ("K_dec", dtype), ("V_dec", dtype), ("FK_dec", dtype),
         ]:
             self.register_buffer(name, torch.empty(0, device=device, dtype=dt))
         self.tokens_seen = 0
@@ -191,7 +192,7 @@ def _lola_forward(
         #y_soft = y_soft_num / (Z_soft + EPS)
         #print('flash y vs. y soft: ', flash_y_soft[0,:5,0,0], y_soft[0,:5,0,0])
 
-        # Step 2 ---- scores --------------------------------
+        # Step 2 ---- calculate scores --------------------------------
         if n>0:
             #Norm of the predicted value error, aka the associated singular value-ish
             #score_c = torch.norm(v_c[n-1] - torch.einsum('b c h f, b h f d -> b c h d',fk_c[n-1], state.H_sum), dim=-1)
@@ -232,44 +233,49 @@ def _lola_forward(
 # 4.  Decode (one token) ===================================================
 # ==========================================================================
 
-#NOTE: WE ARE NOT USING SPARSE CACHING FOR DECODING YET.
 @torch.no_grad()
 def _lola_decode(
         q, k, v, fq, fk, *,
         C: int,
         state: LoLAState,
         gate: torch.Tensor):
-
-    print('DECODING: THIS IS NOT UPDATED YET')
-    #BUG: DECODE DOESNT UPDATE SPARSE CACHING YET
-    #print(torch.norm(state.H_sum))
-    #(B H L D) -> (B L H D)
-    #gate = gate.transpose(1,2)
-
-    q, k, v, fq, fk, gate = (t.transpose(1,2) for t in (q, k, v, fq, fk, gate))
     
-    keys = torch.cat([state.K_top, state.K_win, k], dim=1)
-    values = torch.cat([state.V_top, state.V_win, v], dim=1)
-    y_soft, softmax_lse, S_dmask = flash_attn_func(q, keys, values, return_attn_probs=True, causal=True) #softmax_lse is shape [B H C]
-    #Z_soft = torch.exp(softmax_lse).transpose(1,2).unsqueeze(-1)# was torch.exp(softmax_lse).transpose(-1,-2).unsqueeze(-1) since flash attention returns logsumexp
-    #y_soft_num = y_soft * Z_soft
+    assert state.tokens_seen > 0
+    gate = gate.transpose(1,2).to(q.device, dtype=q.dtype)
+    q,k,v,fk,fq = (rearrange(t, 'b h n d -> b n h d') for t in (q,k,v,fk,fq))
 
-    #y_lin_num = torch.einsum('b c h f, b h f d -> b c h d', fq, state.H_sum)
-    #Z_lin = torch.einsum('b c h f, b h f -> b c h',    fq, state.S_sum).unsqueeze(-1)
-    #y_out = (y_soft_num*(gate) + y_lin_num*(1-gate)) / (Z_soft*(gate) + Z_lin*(1-gate) + EPS)  #This is how it should work.
-    #y_out = (y_soft_num*(1-gate) + y_lin_num*(gate)) / (Z_soft*(1-gate) + Z_lin*(gate) + EPS) #This is how it worked last night...
-    
+    state.K_dec = torch.cat([state.K_dec, k], dim=1)
+    state.V_dec = torch.cat([state.V_dec, v], dim=1)
+    state.FK_dec = torch.cat([state.FK_dec, fk], dim=1)
 
-    #Update LoLA State
-    #state.H_sum += torch.einsum('b h f, b h d -> b h f d', state.FK_win[:,0], state.V_win[:,0])
-    #state.S_sum += state.FK_win[:,0]
-    #state.FK_win = torch.cat([state.FK_win[:,1:],fk],dim=1)
-    state.K_win = torch.cat([state.K_win[:,1:],k],dim=1)
-    state.V_win = torch.cat([state.V_win[:,1:],v],dim=1)
-    state.tokens_seen += 1
+    union_K = torch.cat([state.K_top, state.K_win, state.K_dec], dim=1) #cat (B C H D) along C
+    union_V = torch.cat([state.V_top, state.V_win, state.V_dec], dim=1)
+
+    #Softmax forward
+    y_soft, softmax_lse, S_dmask = flash_attn_func(q, union_K, union_V, causal=True, return_attn_probs=True) #softmax_lse is shape [B H C] #NOTE: do we need causal=True?
+    Z_soft = torch.exp(softmax_lse).transpose(1,2).unsqueeze(-1)# was torch.exp(softmax_lse).transpose(-1,-2).unsqueeze(-1) since flash attention returns logsumexp
+    y_soft_num = y_soft * Z_soft #B C H D 
+
+    #Linear forward
+    y_lin_num = torch.einsum('b c h f, b h f d -> b c h d', fq, state.H_sum)
+    Z_lin = torch.einsum('b c h f, b h f -> b c h',    fq, state.S_sum).unsqueeze(-1)
+    y = (y_soft_num*(gate) + y_lin_num*(1-gate)) / (Z_soft*(gate) + Z_lin*(1-gate) + EPS) 
+
+    #3) if decode cache is full, do a chunkwise update using train_chunk
+    if state.K_dec.size(1) >= C:
+        #Calculate score for the decoding cache
+        predicted_value_num = torch.einsum('b c h f, b h f d -> b c h d', state.FK_win, state.H_sum)
+        Z_predicted_value = torch.einsum('b c h f, b h f -> b c h', state.FK_win, state.S_sum).unsqueeze(-1)
+        predicted_value = predicted_value_num / (Z_predicted_value + EPS)
+        score = torch.norm(state.V_win - predicted_value, dim=-1)
+
+        #Update hidden state, remove last chunk of SW
+        state.train_chunk(state.K_dec, state.V_dec, state.FK_dec, score)
+        state.K_dec = state.K_dec[:,:0]
+        state.V_dec = state.V_dec[:,:0]
+        state.FK_dec = state.FK_dec[:,:0]
     
-    return y_soft.to(q.dtype), state
-    #return y_out.to(q.dtype), state
+    return y.to(q.dtype), state
 
 
 # ==========================================================================
@@ -278,28 +284,26 @@ def _lola_decode(
 def lola_sparse_compatible(
     q, k, fq, fk, v, # [B,H,L,D]
     window_factor,
+    layer_idx: int,
     *, window_size: int,
     global_cache_size: int,
     kv_state: Optional['LinearAttentionSparseSlidingWindowCache'] = None,
     **_,
 ):
-    if q.size(2) > 1:
-        state = LoLAState(window_size, global_cache_size, q.dtype, q.device)
-    else:
-        # only reuse the cache for true step‑by‑step generation (q.size(1)==1)
-        state = kv_state.state if kv_state and kv_state.state else LoLAState(window_size, global_cache_size, q.dtype, q.device)
+    if kv_state is None:
+        kv_state = LinearAttentionSparseSlidingWindowCache(
+            window_size=window_size, global_cache_size=global_cache_size,
+            dtype=q.dtype, device=q.device)
 
+    state = kv_state.get_state(layer_idx)
 
     if q.size(2) > 1: # pre‑fill / training
         y, state = _lola_forward(q, k, v, fq, fk, C=window_size, state=state, gate=window_factor)
     else: # generation
         y, state = _lola_decode(q, k, v, fq, fk, C=window_size, state=state, gate=window_factor)
 
-    if kv_state is None:
-        kv_state = LinearAttentionSparseSlidingWindowCache(
-            window_size=window_size, global_cache_size=global_cache_size,
-            dtype=q.dtype, device=q.device)
-    kv_state.state = state
+    #NOTE: Do i need to update the state here?
+
     return y, None, kv_state
 
 
@@ -317,28 +321,37 @@ class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
         else:
             self.register_buffer('window_factors', gate_init)
         self.quadratic_attention = lola_sparse_compatible
+        self.layer_idx = kw.get('layer_idx')
 
     def forward(self, hidden_states, attention_mask=None,
                 position_ids=None, past_key_value=None,
                 use_cache=False, **kw):
+        
         q, k, v, _ = self.process_qkv(hidden_states, attention_mask,
                                       position_ids, past_key_value)
+        #print('lolcat forward... tokens seen: ', past_key_value.state.tokens_seen, ', q shape:', q.shape)
         f_q, f_k = self.feature_map_q(q), self.feature_map_k(k)
         y, _, new_state = self.quadratic_attention(
-            q, k, f_q, f_k, v,
+            q, k, f_q, f_k, v, 
             torch.sigmoid(self.window_factors),
+            layer_idx=self.layer_idx,
             window_size=self.window_size,
             global_cache_size=self.global_cache_size,
             kv_state=past_key_value)
         y = rearrange(y, 'b l h d -> b l (h d)')
-
-        return self.o_proj(y), new_state, None #(new_state if use_cache else None)
-
+        return self.o_proj(y), new_state, new_state #one of these need to be new_state, not sure.
 
 class LinearAttentionSparseSlidingWindowCache(LinearAttentionState):
     def __init__(self, *, window_size=512, global_cache_size=512,
                  dtype=torch.bfloat16, device='cuda'):
         super().__init__()
-        self.state =LoLAState(window_size, global_cache_size, dtype, device)
-        self.kv_states.append(self.state.H_sum)
-        self.k_states.append(self.state.S_sum)
+        #self.state = LoLAState(window_size, global_cache_size, dtype, device)
+        self._cfg = dict(C=window_size,
+                         G=global_cache_size,
+                         dtype=dtype, device=device)
+        self._states: dict[int, LoLAState] = {}   # layer‑idx → LoLAState
+
+    def get_state(self, layer_idx: int) -> LoLAState:
+        if layer_idx not in self._states:
+            self._states[layer_idx] = LoLAState(**self._cfg)
+        return self._states[layer_idx]

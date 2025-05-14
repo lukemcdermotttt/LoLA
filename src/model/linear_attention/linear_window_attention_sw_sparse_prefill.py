@@ -156,7 +156,14 @@ def hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor,
     #w_mask = mask_window * torch.ones((M, N), device=q.device).tril(M-N-window_size)[None, None, ...] #this should be like no sliding window.
     #w_mask instead of mask_window
     #NOTE: USED TO BE: scores = torch.sum(torch.abs(a_ln - a_sm_exp) * mask_window, dim=-2, keepdim=True)
-    scores = torch.sum(torch.abs(a_ln/a_sm_exp) * mask_window, dim=-2, keepdim=True)
+    
+    y_sm = torch.matmul(a_sm_exp, v.float()) / a_sm_exp.sum(dim=-1, keepdim=True)
+    y_ln = torch.matmul(a_ln, v.float()) / a_ln.sum(dim=-1, keepdim=True)
+    residual = y_sm - y_ln
+    print('resid', residual.size())
+    scores = torch.einsum('bhnd,bhnd->bhn', residual, v.float()).unsqueeze(-1)
+
+    #scores = torch.sum(torch.abs(a_ln/a_sm_exp) * mask_window, dim=-2, keepdim=True)
     local_scores = scores[:,:,0,-window_size:] #Return the last window-size many scores for generation.
     scores = scores * mask_linear
     #scores = scores / (torch.sum(mask_window, dim=-2, keepdim=True)+eps) #NOTE: GET THE AVERAGE SCORE, not the sum of all of them!

@@ -53,7 +53,65 @@ def hybrid_attention_quadratic(q: torch.Tensor, k: torch.Tensor,
     """
     Hybrid attention combining sliding window and linear attentions
     """
+    
+    """
+    #LINEAR ATTENTION APPROACH
+    results = torch.zeros(q.size(0),q.size(1),q.size(2),q.size(2),device=q.device,dtype=q.dtype)
+    h = torch.zeros((q.size(0),q.size(1),f_q.size(-1),v.size(-1)),device=q.device,dtype=q.dtype)
+    s = torch.zeros((q.size(0),q.size(1),f_q.size(-1)),device=q.device,dtype=q.dtype)
+    for n in range(q.size(2)):
+        h += torch.einsum('bhD,bhd->bhDd', f_k[:,:,n], v[:,:,n]) #update hidden state.
+        s += f_k[:,:,n]
+        #predict all values from keys
+        v_pred = torch.einsum('bhDd,bhnD ->bhnd', h, f_k) / (torch.einsum('bhD,bhnD -> bhn', s, f_k).unsqueeze(-1)+1e-6)
+        error = torch.sum((v - v_pred)**2, dim=-1) #(b,h,n)
+        results[:,:,n,:] = error
+    torch.save(results, '/home/archy2/luke/LoLA/lin_attn_errors.pth')
 
+
+    #ChunkWise LOLA APPROACH
+    C = 64
+    results = torch.zeros(q.size(2),q.size(2),device=q.device,dtype=q.dtype)
+    h = torch.zeros((f_q.size(-1),v.size(-1)),device=q.device,dtype=q.dtype)
+    s = torch.zeros((f_q.size(-1)),device=q.device,dtype=q.dtype)
+    fk_cache = f_k[0,0,:C]
+    v_cache = v[0,0,:C]
+    cache_indices = torch.arange(C, device=q.device)
+    
+    for n in range(1,q.size(2) // C):
+        elig_keys = torch.cat([fk_cache,f_k[0,0,n*C:(n+1)*C]], dim=0)
+        elig_values = torch.cat([v_cache, v[0,0,n*C:(n+1)*C]], dim=0)
+        elig_indices = torch.cat([cache_indices, torch.arange(n*C,(n+1)*C, device=q.device)], dim=0)
+
+
+        pred = torch.einsum('Dd,nD ->nd', h, elig_keys) / ((elig_keys @ s).unsqueeze(-1)+1e-6)
+        error = torch.sum((elig_values - pred)**2, dim=-1) #2*C
+        sorted_idx = torch.argsort(error, dim=0, descending=True)
+
+        fk_cache = torch.gather(elig_keys, dim=0, index=sorted_idx.unsqueeze(-1).expand(-1,fk_cache.size(-1)))
+        v_cache = torch.gather(elig_values, dim=0, index=sorted_idx.unsqueeze(-1).expand(-1,v_cache.size(-1)))
+        cache_indices = torch.gather(elig_indices, dim=0, index=sorted_idx)
+
+
+        h += torch.einsum('nD,nd ->Dd', fk_cache[C:], v_cache[C:])
+        s += torch.sum(fk_cache[C:], dim=0)
+
+        fk_cache = fk_cache[:C]
+        v_cache = v_cache[:C]
+        cache_indices = cache_indices[:C]
+
+        #predict all values from keys
+        v_pred = torch.einsum('Dd,nD ->nd', h, f_k[0,0]) / (torch.einsum('D,nD -> n', s, f_k[0,0]).unsqueeze(-1)+1e-6)
+        error = torch.sum((v[0,0] - v_pred)**2, dim=-1) #(n)
+        error[cache_indices] = -1
+        
+        results[n*C:(n+1)*C] = error.repeat(C,1)
+    
+    torch.save(results, '/home/archy2/luke/LoLA/chunkwise_errors.pth')
+    """
+
+    # torch.einsum('bhD,bhd->bhDd')
+    
     mask_window, mask_linear = get_masks(window_size, q.shape[-2], k.shape[-2], q.device)
 
     # 1. Sliding window (softmax attention)
