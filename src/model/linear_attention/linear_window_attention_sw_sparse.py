@@ -291,11 +291,12 @@ def lola_sparse_compatible(
     **_,
 ):
     if kv_state is None:
+        print('kv_state is None init in lola_sparse_compatible')
         kv_state = LinearAttentionSparseSlidingWindowCache(
             window_size=window_size, global_cache_size=global_cache_size,
             dtype=q.dtype, device=q.device)
 
-    state = kv_state.get_state(layer_idx)
+    state = kv_state.get_state(layer_idx, global_cache_size=global_cache_size, window_size=window_size, dtype=q.dtype, device=q.device)
 
     if q.size(2) > 1: # pre‑fill / training
         y, state = _lola_forward(q, k, v, fq, fk, C=window_size, state=state, gate=window_factor)
@@ -329,7 +330,7 @@ class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
         
         q, k, v, _ = self.process_qkv(hidden_states, attention_mask,
                                       position_ids, past_key_value)
-        #print('lolcat forward... tokens seen: ', past_key_value.state.tokens_seen, ', q shape:', q.shape)
+        #print('lolcat forward... q shape:', q.shape)
         f_q, f_k = self.feature_map_q(q), self.feature_map_k(k)
         y, _, new_state = self.quadratic_attention(
             q, k, f_q, f_k, v, 
@@ -342,16 +343,11 @@ class LolcatsSparseSlidingWindowAttention(LolcatsLinearAttention):
         return self.o_proj(y), new_state, new_state #one of these need to be new_state, not sure.
 
 class LinearAttentionSparseSlidingWindowCache(LinearAttentionState):
-    def __init__(self, *, window_size=512, global_cache_size=512,
-                 dtype=torch.bfloat16, device='cuda'):
+    def __init__(self):
         super().__init__()
-        #self.state = LoLAState(window_size, global_cache_size, dtype, device)
-        self._cfg = dict(C=window_size,
-                         G=global_cache_size,
-                         dtype=dtype, device=device)
         self._states: dict[int, LoLAState] = {}   # layer‑idx → LoLAState
 
-    def get_state(self, layer_idx: int) -> LoLAState:
+    def get_state(self, layer_idx: int, global_cache_size: int, window_size: int, dtype,device) -> LoLAState:
         if layer_idx not in self._states:
-            self._states[layer_idx] = LoLAState(**self._cfg)
+            self._states[layer_idx] = LoLAState(G=global_cache_size, C=window_size, dtype=dtype, device=device)
         return self._states[layer_idx]

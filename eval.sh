@@ -9,33 +9,31 @@ python eval_lm_harness.py \
 --finetune_checkpoint_path 'hazyresearch/lolcats-llama-3.1-8b-ft-lora' \
 --model_config_path "configs/model/inference_llama3_1_8b_lola.yaml" \
 --finetune_config_path 'configs/experiment/finetune_lora_qkvo_alpaca_clean.yaml' \
---task niah_single_3 \
+--task niah_single_1 \
 --num_shots 0 \
 --verbose \
---batch_size 1 \
---max_batch_size 1 \
+--batch_size 4 \
+--max_batch_size 4 \
 --project_name lolcat \
 --wandb_entity lmcdermo \
---metadata='{"max_seq_lengths":[2048],"tokenizer":"meta-llama/Llama-3.1-8B-Instruct"}' #for some reason the base model tokenizer broke so.
+--metadata='{"max_seq_lengths":[512],"tokenizer":"meta-llama/Llama-3.1-8B-Instruct"}' #for some reason the base model tokenizer broke so.
 #'hazyresearch/lolcats-llama-3.1-8b-distill' \
 #'hazyresearch/lolcats-llama-3.1-8b-ft-lora' \
 
 
-
-
-
 """
+
 python eval_lm_harness.py \
 --model_type lolcats_ckpt \
 --attn_mlp_checkpoint_path 'hazyresearch/lolcats-llama-3.1-8b-distill' \
 --finetune_checkpoint_path 'hazyresearch/lolcats-llama-3.1-8b-ft-lora' \
 --model_config_path "configs/model/inference_llama3_1_8b_lola.yaml" \
 --finetune_config_path 'configs/experiment/finetune_lora_qkvo_alpaca_clean.yaml' \
---task triviaqa --num_shots 0 --verbose \
+--task longbench_trec --num_shots 0 --verbose \
 --project_name lolcat \
 --wandb_entity lmcdermo
-"""
 
+"""
 """
 python eval_lm_harness.py \
 --model_type lolcats_ckpt \
